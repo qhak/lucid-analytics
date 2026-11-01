@@ -1,9 +1,7 @@
 -- Analytics schema (Cloudflare D1 / SQLite)
 --
--- One row per event. A "pageview" is just an event named 'pageview'.
--- Sessions and all derived metrics (bounce rate, duration, entry/exit pages)
--- are computed at query time from this table — nothing is pre-aggregated,
--- so you can always re-slice historical data differently.
+-- Legacy per-event schema. Rows already present are retained as historical
+-- data; aggregate-only ingestion writes new activity to daily_analytics below.
 
 CREATE TABLE IF NOT EXISTS events (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -201,3 +199,19 @@ WHERE c.kind='repeat' AND c.visible_ms>=5000 AND EXISTS (
 CREATE VIEW IF NOT EXISTS report_sessions AS
 SELECT q.session_id FROM session_quality q WHERE q.qualified=1
 AND NOT EXISTS (SELECT 1 FROM session_automation_exclusions a WHERE a.session_id=q.session_id);
+
+-- Future events are stored as independent daily totals. Existing event rows
+-- remain available as historical data, but new writes do not contain IDs,
+-- timestamps, properties, or combinations that link dimensions together.
+CREATE TABLE IF NOT EXISTS daily_analytics (
+  site          TEXT NOT NULL,
+  day           TEXT NOT NULL,
+  metric        TEXT NOT NULL CHECK (metric IN ('pageview', 'action', 'revenue')),
+  dimension     TEXT NOT NULL,
+  value         TEXT NOT NULL DEFAULT '',
+  count         INTEGER NOT NULL DEFAULT 0 CHECK (count >= 0),
+  revenue_minor INTEGER NOT NULL DEFAULT 0 CHECK (revenue_minor >= 0),
+  PRIMARY KEY (site, day, metric, dimension, value)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_analytics_site_day
+  ON daily_analytics (site, day, metric, dimension);

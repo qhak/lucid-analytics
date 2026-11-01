@@ -1,7 +1,7 @@
-name = "lucid-analytics"
+name = "listvint-analytics"
 main = "src/worker.js"
 # Set these values for your own Cloudflare account and database before deploy.
-account_id = "YOUR_CLOUDFLARE_ACCOUNT_ID"
+account_id = "b57b2f90db289dc433f181c3ac0626be"
 compatibility_date = "2026-08-01"
 
 # Dashboard UI + tracker.js are served from ./public
@@ -16,18 +16,18 @@ directory = "./public"
 binding = "ASSETS"
 run_worker_first = true
 
-# D1 database holding every event.
+# D1 database holding retained legacy event rows and new daily aggregate counts.
 # Create it once:   npx wrangler d1 create analytics
 # then paste the returned database_id below.
 [[d1_databases]]
 binding = "DB"
-database_name = "lucid-analytics"
-database_id = "YOUR_D1_DATABASE_ID"
+database_name = "listvint-analytics"
+database_id = "7f768771-4ff3-4a87-b557-826e87a49452"
 
 [vars]
 # Sites allowed to send events. Anything not listed is rejected, so a
 # stranger who finds the endpoint can't pollute your numbers.
-ALLOWED_SITES = ""
+ALLOWED_SITES = "listvint-studio.koa2.chatgpt.site"
 
 # Excluded places (countries/regions/cities dropped at ingest) are no longer
 # configured here — they live in the D1 `excluded` table and are managed from
@@ -37,14 +37,14 @@ ALLOWED_SITES = ""
 # Set to "1" to allow http://localhost origins while testing.
 ALLOW_LOCAL_DEV = "0"
 
+[triggers]
+crons = []
+
 # SECRETS — never commit these. Set them with:
 #
 #   npx wrangler secret put DASH_PASSWORD
 #     Password for the dashboard (username is anything). This is the only
 #     thing standing between the internet and your stats — make it long.
 #
-#   npx wrangler secret put ID_SALT
-#     Random string used to hash visitor IDs. Generate with:
-#       openssl rand -hex 32
-#     Changing it resets visitor identity (old data stays, but returning
-#     visitors will look new from that point on).
+# Existing ID_SALT secrets may remain configured for historical compatibility;
+# aggregate-only ingestion no longer reads or writes visitor identifiers.

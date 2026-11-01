@@ -10,30 +10,27 @@ Lucid collects page views and custom events through a lightweight script, then s
 
 The dashboard includes:
 
-- Visitors, visits, page views, visit duration and bounce rate
-- Referrers, channels, campaigns, entry pages and exit pages
-- Browser, device, language, network and approximate location breakdowns
-- Custom events, event journeys and configurable event-based revenue totals
-- Recent visits and events, with the dimensions attached to each record
-- Site and browser opt-outs, plus configurable location exclusions
-- Reviewable, reversible rules for filtering suspected automated visits
+- Daily page-view and product-action totals, with optional event-based revenue totals
+- Independent breakdowns for referrer domain, channel, page, country, browser, operating system and device
+- Daily and monthly charts, plus retained all-time totals
+- A password-protected dashboard and configurable location exclusions
 
 The feature set grew from questions I wanted to answer about my own sites. The project is still single-tenant: one dashboard password protects the instance, and there is no signup, billing, or multi-customer account system.
 
 ## Privacy choices and trade-offs
 
-Lucid does not set analytics cookies or use local storage to identify visitors. Daily unique visitor IDs are one-way hashes derived from the request IP address and user agent, with the IP address discarded rather than stored. The daily salt means the visitor ID rotates at UTC midnight.
+New analytics are stored as independent daily counters. The database does not receive visitor or session IDs, event-level timestamps, event properties, full referrer URLs, IP addresses or full user-agent strings. The worker uses the request IP and user-agent only transiently to apply configured location exclusions and classify broad country/browser/device categories. Dimensions are counted independently; the database does not keep a row linking an action to a particular page, location or device.
 
-Returning-visitor reporting uses a separate one-way hash that persists across days. It is still derived from IP address and user agent, so it can be inaccurate when either changes. This keeps a useful returning-visitor estimate without a browser identifier, but it is a privacy trade-off—not anonymous measurement. Lucid also records contextual dimensions such as approximate location, browser, network and screen size, which can make a visit more distinctive in combination.
+The `events` and `session_quality` tables retain historical visit-level records from before aggregate-only ingestion was introduced. The migration does not delete them. Per-visit, journey, event-feed and automation-detail endpoints are disabled; historical rows remain in D1 until the operator deletes them manually. Daily aggregates also have no automatic expiry.
 
-The project is designed to avoid cookie-based tracking; that alone does not determine what privacy notice or legal obligations apply to a particular deployment. Review the data you choose to collect and the rules that apply where your site operates.
+Listvint turns aggregate analytics on by default and provides a browser-level off switch in its Privacy settings. This code structure does not by itself determine which privacy notice or legal basis applies to a deployment; review the data and rules applicable where the site operates.
 
 ## A few implementation decisions
 
 - **Self-hosted collection:** the tracking endpoint, dashboard and database run in the owner's Cloudflare account.
-- **Small tracker:** sites include `public/tracker.js`; it sends page views and visible-time engagement, and supports custom events.
-- **Visit-based attribution:** event reports retain the source recorded when a visit began, rather than attributing later events to Direct.
-- **Cautious automation filtering:** short visits are not automatically labelled bots. Site-specific rules can be reviewed and reversed, and raw events are retained. No site-specific rules are enabled by default.
+- **Small tracker:** it sends only a safe page path, a fixed event name and (on page views) the referrer origin. Custom properties and query strings are ignored.
+- **Daily aggregation:** counters are stored by UTC date and a single independent dimension, without a person-level event sequence.
+- **Listvint deployment retention:** new aggregate counts and older historical event/visit rows have no automatic expiry. The operator must clear them manually.
 - **No billing system:** this began as a tool for my own use, so account plans, subscriptions and customer management are outside its scope.
 
 ## Tech stack
@@ -81,18 +78,16 @@ Lucid is built around Cloudflare Workers and D1. To create a separate instance:
    npx wrangler d1 execute lucid-analytics --remote --file=./schema.sql
    ```
 
-4. Set the dashboard password and a random ID salt as Worker secrets:
+4. Set the dashboard password as a Worker secret:
 
    ```bash
    npx wrangler secret put DASH_PASSWORD
-   npx wrangler secret put ID_SALT
    ```
 
-   Generate `ID_SALT` locally, for example with `openssl rand -hex 32`. Changing it resets visitor identity for future events.
-
-5. Set `ALLOWED_SITES` in `wrangler.toml` to the site origins allowed to send events, then deploy:
+5. Apply the aggregate-only migration, set `ALLOWED_SITES` in `wrangler.toml` to the site origins allowed to send events, then deploy:
 
    ```bash
+   npx wrangler d1 migrations apply listvint-analytics --remote
    npx wrangler deploy
    ```
 
@@ -110,15 +105,17 @@ Add the deployed Worker URL and your site domain to the page:
 Custom events can be sent with `stats`:
 
 ```js
-stats('signup_complete');
-stats('scan_result', { tier: 'elite' });
+stats('/price_estimate_complete');
+stats('/sign_in_failed');
 ```
+
+For this Listvint deployment, accepted action names are explicitly allowlisted in `src/worker.js`. Add a fixed path there before calling it from the site; event properties are not accepted or stored.
 
 ## Repository map
 
 | Path | Purpose |
 | --- | --- |
-| `src/worker.js` | Event collection, authentication, session handling and dashboard APIs |
+| `src/worker.js` | Aggregate event collection, authentication and dashboard APIs |
 | `public/tracker.js` | Site tracking script |
 | `public/` | Dashboard assets |
 | `schema.sql` | Schema for a fresh database |

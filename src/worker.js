@@ -3,14 +3,14 @@
  *
  *   POST   /event         public  — receives events from tracker.js
  *   GET    /tracker.js    public  — the script embedded on tracked sites
- *   GET    /api/sites     private — site cards for the index page (24h sparkline)
+ *   GET    /api/sites     private — site cards for the index page (daily aggregate sparkline)
  *   POST   /api/sites     private — register a new site to track
  *   DELETE /api/sites     private — remove a site (its events are kept)
  *   GET    /api/stats     private — everything the dashboard renders
  *   GET/POST/DELETE /api/revenue-settings private — per-site revenue rules
- *   GET    /api/journey   private — "what happens next" for a chosen start step
- *   GET    /api/visits    private — individual visits, newest first
- *   GET    /api/events    private — individual custom events + their properties
+ *   GET    /api/journey   private — disabled; new analytics are aggregate-only
+ *   GET    /api/visits    private — disabled; no new visit histories are stored
+ *   GET    /api/events    private — disabled; use daily action totals in stats
  *   GET    /api/excluded  private — list of places dropped at ingest
  *   POST   /api/excluded  private — add a place to drop
  *   DELETE /api/excluded  private — stop dropping a place
@@ -20,16 +20,14 @@
  *
  * Sites live in the D1 `sites` table so they can be added from the UI;
  * ALLOWED_SITES in wrangler.toml still works as a bootstrap list and the two
- * are unioned. No cookies are set on visitors — identity is a daily-rotating
- * hash (salt + UTC date + site + IP + UA), the same approach Plausible uses.
+ * are unioned. New requests increment independent daily totals. They do not
+ * create visitor IDs, session IDs, exact event timestamps or event properties.
  *
  * Live-only, on purpose: there is no import feature. An importer that has to
  * guess which of two export formats it received, and whether the numbers were
  * filtered when they were exported, is a worse source of truth than a graph
  * that starts at zero and only ever shows what actually happened.
  */
-
-const SESSION_GAP = 30 * 60; // seconds of inactivity that ends a visit
 
 /* ------------------------------------------------------------------ */
 /* routing                                                             */
@@ -77,16 +75,15 @@ export default {
       return new Response("Method not allowed", { status: 405 });
     }
     if (url.pathname === "/api/stats") return handleStats(request, env, url);
-    if (url.pathname === '/api/automation') return handleAutomation(request, env, url);
     if (url.pathname === "/api/revenue-settings") {
       if (request.method === "GET") return handleRevenueSettings(env, url);
       if (request.method === "POST") return handleRevenueSettingsSave(request, env, url);
       if (request.method === "DELETE") return handleRevenueRuleRemove(env, url);
       return new Response("Method not allowed", { status: 405 });
     }
-    if (url.pathname === "/api/journey") return handleJourney(env, url);
-    if (url.pathname === "/api/visits") return handleVisits(env, url);
-    if (url.pathname === "/api/events") return handleEvents(env, url);
+    if (["/api/journey", "/api/visits", "/api/events", "/api/automation"].includes(url.pathname)) {
+      return json({ error: "Per-visitor reports are disabled. This dashboard uses aggregate daily totals." }, 410);
+    }
     if (url.pathname === "/api/excluded") {
       if (request.method === "GET") return handleExcludedList(env);
       if (request.method === "POST") return handleExcludedAdd(request, env);
@@ -104,6 +101,7 @@ export default {
     headers.set("Cache-Control", "no-store, must-revalidate");
     return new Response(asset.body, { status: asset.status, headers });
   },
+
 };
 
 /* ------------------------------------------------------------------ */
@@ -209,49 +207,36 @@ async function handleSiteRemove(env, url) {
   return json({ ok: true, removed: domain, eventsKept: true });
 }
 
-/** Site cards for the index page: 24h visitors, delta vs the 24h before, sparkline. */
+/** Site cards show daily aggregate pageview totals and a seven-day sparkline. */
 async function handleSitesSummary(env) {
-  const now = Math.floor(Date.now() / 1000);
-  const dayAgo = now - 86400;
-  const twoDaysAgo = now - 2 * 86400;
-  const excluded = await automationSessionIds(env);
-
+  const today = new Date().toISOString().slice(0, 10);
+  const yesterday = new Date(Date.now() - 86400_000).toISOString().slice(0, 10);
+  const weekStart = new Date(Date.now() - 6 * 86400_000).toISOString().slice(0, 10);
   const [cur, prev, spark, withEvents] = await env.DB.batch([
-    env.DB.prepare(
-      `SELECT site, COUNT(DISTINCT visitor_id) v FROM events WHERE session_id IN (SELECT session_id FROM session_quality WHERE qualified=1) AND session_id NOT IN (SELECT value FROM json_each(?)) AND ts >= ? GROUP BY site`
-    ).bind(excluded,dayAgo),
-    env.DB.prepare(
-      `SELECT site, COUNT(DISTINCT visitor_id) v FROM events WHERE session_id IN (SELECT session_id FROM session_quality WHERE qualified=1) AND session_id NOT IN (SELECT value FROM json_each(?)) AND ts >= ? AND ts < ? GROUP BY site`
-    ).bind(excluded,twoDaysAgo, dayAgo),
-    env.DB.prepare(
-      `SELECT site, strftime('%Y-%m-%dT%H', ts, 'unixepoch') h, COUNT(DISTINCT visitor_id) v
-         FROM events WHERE session_id IN (SELECT session_id FROM session_quality WHERE qualified=1) AND session_id NOT IN (SELECT value FROM json_each(?)) AND ts >= ? GROUP BY site, h ORDER BY h`
-    ).bind(excluded,dayAgo),
-    env.DB.prepare(`SELECT DISTINCT site FROM events`),
+    env.DB.prepare(`SELECT site, SUM(count) AS v FROM daily_analytics
+      WHERE day=? AND metric='pageview' AND dimension='all' GROUP BY site`).bind(today),
+    env.DB.prepare(`SELECT site, SUM(count) AS v FROM daily_analytics
+      WHERE day=? AND metric='pageview' AND dimension='all' GROUP BY site`).bind(yesterday),
+    env.DB.prepare(`SELECT site, day AS t, SUM(count) AS v FROM daily_analytics
+      WHERE day>=? AND metric='pageview' AND dimension='all' GROUP BY site,day ORDER BY day`).bind(weekStart),
+    env.DB.prepare('SELECT DISTINCT site FROM daily_analytics'),
   ]);
 
   const curMap = Object.fromEntries((cur.results || []).map((r) => [r.site, r.v]));
   const prevMap = Object.fromEntries((prev.results || []).map((r) => [r.site, r.v]));
   const sparkMap = {};
-  for (const r of spark.results || []) (sparkMap[r.site] ||= []).push({ t: r.h, v: r.v });
-
-  const domains = new Set([
-    ...(await allowedSites(env)),
-    ...(withEvents.results || []).map((r) => r.site),
-  ]);
-
-  const sites = [...domains].sort().map((d) => ({
-    domain: d,
-    visitors24h: curMap[d] || 0,
-    prev24h: prevMap[d] || 0,
-    delta: pctChange(curMap[d] || 0, prevMap[d] || 0),
-    spark: sparkMap[d] || [],
+  for (const r of spark.results || []) (sparkMap[r.site] ||= []).push({ t: r.t, v: r.v });
+  const domains = new Set([...(await allowedSites(env)), ...(withEvents.results || []).map((r) => r.site)]);
+  const sites = [...domains].sort().map((domain) => ({
+    domain,
+    pageviewsToday: curMap[domain] || 0,
+    prevDay: prevMap[domain] || 0,
+    delta: pctChange(curMap[domain] || 0, prevMap[domain] || 0),
+    spark: sparkMap[domain] || [],
   }));
-
-  sites.sort((a, b) => b.visitors24h - a.visitors24h);
+  sites.sort((a, b) => b.pageviewsToday - a.pageviewsToday);
   return json({ sites });
 }
-
 /* ------------------------------------------------------------------ */
 /* excluded places (D1 `excluded` table, self-serve from the dashboard) */
 /* ------------------------------------------------------------------ */
@@ -434,324 +419,166 @@ async function preflight(request, env) {
 /* ------------------------------------------------------------------ */
 
 // These are consistency checks, not proof of a human: non-browser clients
-// can forge Origin. Check before any quality/session/event writes.
+// can forge Origin. Check before any aggregate write.
+const ALLOWED_EVENT_NAMES = new Set([
+  '/background_removal_complete','/background_removal_failed','/custom_background_applied','/custom_background_failed',
+  '/listing_analysis_complete','/listing_analysis_failed','/model_photo_complete','/model_photo_failed',
+  '/photo_comparison_used','/photo_downloaded','/photo_enhance_complete','/photo_enhance_failed',
+  '/photo_upload_failed','/photo_uploaded','/price_estimate_complete','/price_estimate_failed',
+  '/price_estimate_limit_reached','/price_estimate_signup_preview','/google_sign_in_complete',
+  '/google_sign_in_failed','/password_reset_complete','/password_reset_requested','/password_reset_failed',
+  '/sign_up_submitted','/sign_in_complete','/sign_in_failed','/sign_up_failed','/google_sign_in_started','/sign_out_complete',
+]);
+const ALLOWED_PAGE_PATHS = new Set(['/','/account','/privacy','/terms']);
+
+function domainOf(referrer, site) {
+  if (!referrer) return null;
+  try {
+    const host = new URL(referrer).hostname.toLowerCase().replace(/^www\./, '');
+    if (host === site || host.endsWith('.' + site)) return null;
+    return host;
+  } catch { return null; }
+}
+
+const SEARCH_ENGINES = ['google','bing','duckduckgo','yahoo','yandex','baidu','ecosia','startpage','qwant','search.brave'];
+const SOCIAL_NETWORKS = ['instagram','facebook','fb.com','tiktok','twitter','x.com','t.co','linkedin','reddit','youtube','pinterest','snapchat','threads','discord','whatsapp','telegram','tumblr','quora'];
+function classifyChannel(refDomain) {
+  if (!refDomain) return 'Direct';
+  if (SEARCH_ENGINES.some((name) => refDomain.includes(name))) return 'Organic Search';
+  if (SOCIAL_NETWORKS.some((name) => refDomain.includes(name))) return 'Organic Social';
+  return 'Referral';
+}
+
+function parseUA(ua) {
+  const value = ua || '';
+  let browser = 'Unknown';
+  if (/Instagram/i.test(value)) browser = 'Instagram';
+  else if (/BytedanceWebview|TikTok|musical_ly/i.test(value)) browser = 'TikTok';
+  else if (/FBAN|FBAV|FB_IAB/i.test(value)) browser = 'Facebook';
+  else if (/Snapchat/i.test(value)) browser = 'Snapchat';
+  else if (/LinkedInApp/i.test(value)) browser = 'LinkedIn';
+  else if (/Twitter/i.test(value)) browser = 'X';
+  else if (/Pinterest/i.test(value)) browser = 'Pinterest';
+  else if (/Edg\//i.test(value)) browser = 'Edge';
+  else if (/OPR\/|Opera/i.test(value)) browser = 'Opera';
+  else if (/SamsungBrowser/i.test(value)) browser = 'Samsung Internet';
+  else if (/Firefox\/|FxiOS/i.test(value)) browser = 'Firefox';
+  else if (/Chrome\/|CriOS/i.test(value)) browser = 'Chrome';
+  else if (/Safari\//i.test(value)) browser = 'Safari';
+  let os = 'Unknown';
+  if (/iPhone|iPad|iPod/i.test(value)) os = 'iOS';
+  else if (/Android/i.test(value)) os = 'Android';
+  else if (/Windows NT/i.test(value)) os = 'Windows';
+  else if (/Mac OS X|Macintosh/i.test(value)) os = 'macOS';
+  else if (/CrOS/i.test(value)) os = 'ChromeOS';
+  else if (/Linux/i.test(value)) os = 'Linux';
+  let device = 'Desktop';
+  if (/iPad|Tablet/i.test(value) || (/Android/i.test(value) && !/Mobile/i.test(value))) device = 'Tablet';
+  else if (/Mobi|iPhone|iPod|Android/i.test(value)) device = 'Mobile';
+  return { browser, os, device };
+}
+
+function looksLikeBot(ua) {
+  return /bot|crawler|spider|crawling|preview|monitor|curl|wget|python-requests|headless|lighthouse|pingdom|uptime/i.test(ua || '');
+}
+
 function validateEvent(body, origin) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) return 'invalid event';
   if (typeof body.d !== 'string' || !DOMAIN_RE.test(body.d)) return 'invalid site';
-  if (typeof body.u !== 'string') return 'invalid page URL';
+  if (typeof body.u !== 'string' || body.u.length > 2048) return 'invalid page URL';
   try {
     const page = new URL(body.u);
     if (!['https:', 'http:'].includes(page.protocol) || page.username || page.password) return 'invalid page URL';
     if (page.origin !== origin || normalizeDomain(page.hostname) !== normalizeDomain(body.d)) return 'site/origin mismatch';
   } catch { return 'invalid page URL'; }
-  if (body.n !== undefined && (typeof body.n !== 'string' || !body.n.trim() || body.n.length > 64 || /[\u0000-\u001f\u007f]/.test(body.n))) return 'invalid event name';
-  if (typeof body.n === 'string' && body.n.startsWith('__lucid_') && body.n !== '__lucid_engagement') return 'reserved event name';
-  if (body.delta_ms !== undefined && (!Number.isFinite(body.delta_ms) || body.delta_ms < 0)) return 'invalid engagement time';
+  if (body.n !== 'pageview' && !ALLOWED_EVENT_NAMES.has(body.n)) return 'unsupported event name';
+  if (body.r != null && (typeof body.r !== 'string' || body.r.length > 2048)) return 'invalid referrer';
   return null;
 }
 
-async function handleEvent(request, env, ctx) {
+async function handleEvent(request, env) {
   const cors = await corsHeaders(request, env);
   if (!cors['Access-Control-Allow-Origin']) return json({ error: 'origin not allowed' }, 403);
 
   let body;
   try {
-    body = await request.json();
+    const raw = await request.text();
+    if (raw.length > 2048) return json({ error: 'event too large' }, 413, cors);
+    body = JSON.parse(raw);
   } catch {
-    return json({ error: "bad json" }, 400, cors);
+    return json({ error: 'bad json' }, 400, cors);
   }
   const validationError = validateEvent(body, request.headers.get('Origin'));
   if (validationError) return json({ error: validationError }, 400, cors);
 
-  // Ignore explicit owner visits before storing any event or quality record.
-  try {
-    const switches = new URL(body.u).searchParams;
-    if (switches.get('lucidignore') === 'true' || switches.has('exclude_me')) return json({ok:true,ignored:'self'},202,cors);
-  } catch {}
-  // Resolve the site from the payload, and verify it is one we track.
+  let pageUrl;
+  try { pageUrl = new URL(body.u); } catch { return json({ error: 'invalid page URL' }, 400, cors); }
+  if (pageUrl.searchParams.get('lucidignore') === 'true' || pageUrl.searchParams.has('exclude_me')) return json({ ok: true, ignored: 'self' }, 202, cors);
+
   const site = normalizeDomain(body.d);
-  if (!site || !(await allowedSites(env)).includes(site)) {
-    return json({ error: "unknown site" }, 403, cors);
-  }
+  if (!site || !(await allowedSites(env)).includes(site)) return json({ error: 'unknown site' }, 403, cors);
 
   const cf = request.cf || {};
-  const region = cf.region || null;
+  if (isExcludedPlace(await excludedPlaces(env), cf)) return json({ ok: true, ignored: 'place' }, 202, cors);
+  const ua = request.headers.get('User-Agent') || '';
+  if (looksLikeBot(ua)) return json({ ok: true, ignored: 'bot' }, 202, cors);
 
-  // Drop excluded places before they are ever stored. Managed from the
-  // dashboard (Excluded Places), not a config file — takes effect within 60s.
-  if (isExcludedPlace(await excludedPlaces(env), cf)) {
-    return json({ ok: true, ignored: "place" }, 202, cors);
-  }
+  // Only fixed public routes are retained. Query strings and fragments never
+  // enter the aggregate table, and unrecognized routes collapse to one bucket.
+  const requestedPath = pageUrl.pathname.replace(/\/{2,}/g, '/').replace(/\/$/, '') || '/';
+  const path = ALLOWED_PAGE_PATHS.has(requestedPath) ? requestedPath : '/other';
+  const isPageview = body.n === 'pageview';
+  const metric = isPageview ? 'pageview' : 'action';
+  const name = isPageview ? '' : body.n;
+  const day = new Date().toISOString().slice(0, 10);
+  const refDomain = isPageview ? domainOf(body.r, site) : null;
+  const channel = isPageview ? classifyChannel(refDomain, null) : null;
+  const client = isPageview ? parseUA(ua) : null;
+  const country = isPageview && /^[A-Z]{2}$/.test(cf.country || '') ? cf.country : null;
+  const values = new Map();
+  const add = (recordMetric, dimension, value) => {
+    if (value == null || value === '') return;
+    values.set([recordMetric, dimension, String(value)].join('\u0000'), [recordMetric, dimension, String(value)]);
+  };
 
-  const ua = request.headers.get("User-Agent") || "";
-  const knownBot = looksLikeBot(ua);
-
-  const ip = request.headers.get("CF-Connecting-IP") || "";
-  const name = String(body.n || "pageview").slice(0, 64);
-
-  // Page + campaign data
-  let path = null;
-  let utm = { source: null, medium: null, campaign: null };
-  try {
-    const pageUrl = new URL(body.u);
-    path = pageUrl.pathname.replace(/\/+$/, "") || "/";
-    utm = {
-      source: pageUrl.searchParams.get("utm_source"),
-      medium: pageUrl.searchParams.get("utm_medium"),
-      campaign: pageUrl.searchParams.get("utm_campaign"),
-    };
-  } catch {
-    /* leave nulls */
-  }
-
-  let referrer = body.r || null;
-  let refDomain = domainOf(referrer, site);
-  let channel = classifyChannel(refDomain, utm);
-  const client = parseUA(ua);
-
-  const now = Math.floor(Date.now() / 1000);
-  const salt = env.ID_SALT || "";
-  const visitor = await visitorId(ip, ua, site, salt);
-  const person = await personId(ip, ua, site, salt);
-
-  // Stitch into an existing visit if this visitor was active recently.
-  const recent = await env.DB.prepare(
-    `SELECT session_id, channel, referrer, ref_domain, utm_source, utm_medium, utm_campaign, is_returning
-       FROM events
-      WHERE visitor_id = ? AND ts >= ?
-      ORDER BY ts DESC LIMIT 1`
-  )
-    .bind(visitor, now - SESSION_GAP)
-    .first();
-
-  const qualityVisit = await env.DB.prepare('SELECT session_id FROM session_quality WHERE visitor_id = ? AND last_ts >= ? ORDER BY last_ts DESC LIMIT 1').bind(visitor,now - SESSION_GAP).first();
-  const session = recent?.session_id || qualityVisit?.session_id || crypto.randomUUID();
-  // Each tracker message carries only newly elapsed visible milliseconds.
-  const deltaMs = !knownBot && Number.isFinite(body.delta_ms) ? Math.max(0,Math.min(Math.floor(body.delta_ms),SESSION_GAP*1000)) : 0;
-  // A fast navigation to a distinct page proves this was not an instant
-  // single-page bounce. Store the first two paths on the quality row so the
-  // decision stays atomic even if pageview beacons arrive close together.
-  const pagePath = name === 'pageview' ? path : null;
-  await env.DB.prepare(`INSERT INTO session_quality(session_id,site,visitor_id,first_ts,last_ts,visible_ms,qualified,reason,first_page,second_page)
-    VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(session_id) DO UPDATE SET
-    last_ts=excluded.last_ts,
-    visible_ms=session_quality.visible_ms+excluded.visible_ms,
-    first_page=COALESCE(session_quality.first_page,excluded.first_page),
-    second_page=COALESCE(session_quality.second_page,CASE WHEN session_quality.first_page IS NOT NULL AND excluded.first_page IS NOT NULL AND session_quality.first_page!=excluded.first_page THEN excluded.first_page ELSE NULL END),
-    qualified=CASE WHEN session_quality.reason IN ('known_bot','suspected_automation_batch') THEN 0 ELSE MAX(session_quality.qualified,CASE WHEN session_quality.visible_ms+excluded.visible_ms>=2000 OR session_quality.second_page IS NOT NULL OR (session_quality.first_page IS NOT NULL AND excluded.first_page IS NOT NULL AND session_quality.first_page!=excluded.first_page) THEN 1 ELSE 0 END) END,
-    reason=CASE WHEN session_quality.reason IN ('known_bot','suspected_automation_batch') THEN session_quality.reason WHEN session_quality.visible_ms+excluded.visible_ms>=2000 OR session_quality.second_page IS NOT NULL OR (session_quality.first_page IS NOT NULL AND excluded.first_page IS NOT NULL AND session_quality.first_page!=excluded.first_page) THEN 'confirmed' ELSE session_quality.reason END`)
-    .bind(session,site,visitor,now,now,deltaMs,knownBot?0:deltaMs>=2000?1:0,knownBot?'known_bot':deltaMs>=2000?'confirmed':'unconfirmed',pagePath,null).run();
-  if (knownBot) return json({ok:true,ignored:'bot'},202,cors);
-  // Engagement confirms dwell time; it is never a goal or an extra pageview.
-  if (name === '__lucid_engagement') return json({ok:true},202,cors);
-  if (name.startsWith('__lucid_')) return json({error:'reserved event name'},400,cors);
-
-  // New vs returning is a property of the visit, decided once when it starts
-  // and then carried by every event in it. Mid-visit events must not re-check,
-  // or they would all count as "returning" the moment the first one is stored.
-  let isReturning = 0;
-  if (recent) {
-    isReturning = recent.is_returning || 0;
+  // Each dimension is counted independently. There is no row that links a
+  // page, action, location, device and referrer to the same request.
+  add(metric, 'all', '');
+  if (isPageview) {
+    add('pageview', 'path', path);
+    add('pageview', 'channel', channel);
+    add('pageview', 'ref_domain', refDomain);
+    add('pageview', 'country', country);
+    add('pageview', 'browser', client.browser);
+    add('pageview', 'os', client.os);
+    add('pageview', 'device', client.device);
   } else {
-    const seen = await env.DB.prepare(
-      `SELECT 1 FROM events WHERE person_id = ? AND session_id IN (SELECT session_id FROM report_sessions) LIMIT 1`
-    ).bind(person).first();
-    isReturning = seen ? 1 : 0;
+    add('action', 'name', name);
+    add('action', 'path', path);
   }
 
-  // Where a visit came from is a property of the visit, not of each hit inside
-  // it. A custom event fired mid-visit carries no referrer, so left alone it
-  // would be filed under "Direct" and quietly credit the wrong channel for a
-  // visitor who actually arrived from Instagram. Inherit the visit's original
-  // attribution instead.
-  if (recent) {
-    channel = recent.channel || channel;
-    referrer = recent.referrer || referrer;
-    refDomain = recent.ref_domain || refDomain;
-    utm = {
-      source: recent.utm_source || utm.source,
-      medium: recent.utm_medium || utm.medium,
-      campaign: recent.utm_campaign || utm.campaign,
-    };
-  }
-
-  // Primary language only — "en-GB,en;q=0.9,it;q=0.8" becomes "en-GB".
-  const language = (request.headers.get("Accept-Language") || "")
-    .split(",")[0].trim().slice(0, 12) || null;
-
-  const screen = Number.isFinite(+body.w) && +body.w > 0 ? Math.min(+body.w, 20000) : null;
-
-  const insert = env.DB.prepare(
-    `INSERT INTO events
-       (site, ts, name, path, referrer, ref_domain, channel,
-        utm_source, utm_medium, utm_campaign,
-        visitor_id, session_id, person_id, is_returning,
-        country, region, city, continent, timezone,
-        browser, os, device, network, language, screen, props)
-     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(
-    site,
-    now,
-    name,
-    path,
-    referrer,
-    refDomain,
-    channel,
-    utm.source,
-    utm.medium,
-    utm.campaign,
-    visitor,
-    session,
-    person,
-    isReturning,
-    cf.country || null,
-    region,
-    cf.city || null,
-    cf.continent || null,
-    cf.timezone || null,
-    client.browser,
-    client.os,
-    client.device,
-    cf.asOrganization || null,
-    language,
-    screen,
-    body.p ? JSON.stringify(body.p).slice(0, 2000) : null
+  const statements = [...values.values()].map(([recordMetric, dimension, value]) =>
+    env.DB.prepare(`INSERT INTO daily_analytics (site,day,metric,dimension,value,count)
+      VALUES (?,?,?,?,?,1)
+      ON CONFLICT(site,day,metric,dimension,value) DO UPDATE SET count=daily_analytics.count+1`)
+      .bind(site, day, recordMetric, dimension, value)
   );
 
-  // Respond immediately; the write finishes in the background.
-  await insert.run();
-  return json({ ok: true }, 202, cors);
-}
-
-/** Daily-rotating, non-reversible visitor hash. No cookie, no stored IP. */
-async function visitorId(ip, ua, site, salt) {
-  const day = new Date().toISOString().slice(0, 10); // UTC date
-  return sha256Hex(`${salt}|${day}|${site}|${ip}|${ua}`);
-}
-
-/**
- * Stable, non-reversible hash used only to answer "have we seen this person
- * before?". No date component, so unlike visitorId it survives midnight.
- *
- * Still nothing stored on the device and still not reversible, but it is
- * genuinely persistent linking, so it is kept in its own column and is never
- * used for the unique-visitor count — that stays on the daily hash.
- *
- * It is also naturally lossy: mobile carriers reassign IPs constantly and any
- * browser update changes the UA, both of which mint a new person. Returning
- * visitors are therefore under-counted, never over-counted.
- */
-async function personId(ip, ua, site, salt) {
-  return sha256Hex(`person|${salt}|${site}|${ip}|${ua}`);
-}
-
-async function sha256Hex(input) {
-  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(input));
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
-}
-
-/* ------------------------------------------------------------------ */
-/* classification                                                      */
-/* ------------------------------------------------------------------ */
-
-function domainOf(referrer, site) {
-  if (!referrer) return null;
-  try {
-    const host = new URL(referrer).hostname.toLowerCase().replace(/^www\./, "");
-    if (host === site || host.endsWith(`.${site}`)) return null; // internal navigation
-    return host;
-  } catch {
-    return null;
+  if (!isPageview) {
+    const rule = await env.DB.prepare('SELECT amount_minor FROM revenue_rules WHERE site=? AND event_name=?').bind(site, name).first();
+    if (rule && Number.isInteger(rule.amount_minor) && rule.amount_minor > 0) {
+      const currencyRow = await env.DB.prepare('SELECT currency FROM revenue_settings WHERE site=?').bind(site).first();
+      const currency = /^[A-Z]{3}$/.test(currencyRow?.currency || '') ? currencyRow.currency : 'USD';
+      statements.push(env.DB.prepare(`INSERT INTO daily_analytics (site,day,metric,dimension,value,count,revenue_minor)
+        VALUES (?,?,'revenue','all','',1,?)
+        ON CONFLICT(site,day,metric,dimension,value) DO UPDATE SET
+          count=daily_analytics.count+1,revenue_minor=daily_analytics.revenue_minor+excluded.revenue_minor`).bind(site, day, rule.amount_minor));
+    }
   }
+
+  await env.DB.batch(statements);
+  return json({ ok: true, aggregateOnly: true }, 202, cors);
 }
-
-const SEARCH_ENGINES = [
-  "google", "bing", "duckduckgo", "yahoo", "yandex", "baidu",
-  "ecosia", "startpage", "qwant", "search.brave",
-];
-
-const SOCIAL_NETWORKS = [
-  "instagram", "facebook", "fb.com", "tiktok", "twitter", "x.com", "t.co",
-  "linkedin", "reddit", "youtube", "pinterest", "snapchat", "threads",
-  "discord", "whatsapp", "telegram", "tumblr", "quora",
-];
-
-function classifyChannel(refDomain, utm) {
-  const medium = (utm.medium || "").toLowerCase();
-  if (["cpc", "ppc", "paid", "paidsearch", "paid-social", "display"].includes(medium)) return "Paid";
-  if (medium === "email") return "Email";
-
-  if (!refDomain) return "Direct";
-  if (SEARCH_ENGINES.some((s) => refDomain.includes(s))) return "Organic Search";
-  if (SOCIAL_NETWORKS.some((s) => refDomain.includes(s))) return "Organic Social";
-  return "Referral";
-}
-
-/**
- * Compact user-agent parser.
- *
- * In-app browsers are named specifically (Instagram, TikTok, ...) rather than
- * lumped into a single "Mobile App" bucket, because for an Instagram-driven
- * funnel that distinction is the whole point — it tells you which platform is
- * actually sending traffic even when the referrer is stripped.
- */
-function parseUA(ua) {
-  const s = ua || "";
-  let browser = "Unknown";
-
-  if (/Instagram/i.test(s)) browser = "Instagram";
-  else if (/BytedanceWebview|TikTok|musical_ly/i.test(s)) browser = "TikTok";
-  else if (/FBAN|FBAV|FB_IAB/i.test(s)) browser = "Facebook";
-  else if (/Snapchat/i.test(s)) browser = "Snapchat";
-  else if (/LinkedInApp/i.test(s)) browser = "LinkedIn";
-  else if (/Twitter/i.test(s)) browser = "X";
-  else if (/Pinterest/i.test(s)) browser = "Pinterest";
-  else if (/Edg\//i.test(s)) browser = "Edge";
-  else if (/OPR\/|Opera/i.test(s)) browser = "Opera";
-  else if (/SamsungBrowser/i.test(s)) browser = "Samsung Internet";
-  else if (/Firefox\/|FxiOS/i.test(s)) browser = "Firefox";
-  else if (/Chrome\/|CriOS/i.test(s)) browser = "Chrome";
-  else if (/Safari\//i.test(s)) browser = "Safari";
-
-  let os = "Unknown";
-  if (/iPhone|iPad|iPod/i.test(s)) os = "iOS";
-  else if (/Android/i.test(s)) os = "Android";
-  else if (/Windows NT/i.test(s)) os = "Windows";
-  else if (/Mac OS X|Macintosh/i.test(s)) os = "macOS";
-  else if (/CrOS/i.test(s)) os = "ChromeOS";
-  else if (/Linux/i.test(s)) os = "Linux";
-
-  let device = "Desktop";
-  if (/iPad|Tablet/i.test(s) || (/Android/i.test(s) && !/Mobile/i.test(s))) device = "Tablet";
-  else if (/Mobi|iPhone|iPod|Android/i.test(s)) device = "Mobile";
-
-  return { browser, os, device };
-}
-
-function looksLikeBot(ua) {
-  return /bot|crawler|spider|crawling|preview|monitor|curl|wget|python-requests|headless|lighthouse|pingdom|uptime/i.test(
-    ua || ""
-  );
-}
-
-/* ------------------------------------------------------------------ */
-/* stats API                                                           */
-/* ------------------------------------------------------------------ */
-
-// Viewport width → the same four buckets Plausible reports.
-const SCREEN_SQL = `CASE
-    WHEN screen IS NULL   THEN NULL
-    WHEN screen <  576    THEN 'Mobile'
-    WHEN screen <  992    THEN 'Tablet'
-    WHEN screen < 1440    THEN 'Laptop'
-    ELSE 'Desktop'
-  END`;
-
-const VISITOR_TYPE_SQL = `CASE WHEN is_returning = 1 THEN 'Returning' ELSE 'New' END`;
-
-// Only these may be filtered or grouped on, and each maps to a fixed SQL
-// expression. Values are always bound; nothing from the query string is ever
-// interpolated as an identifier.
 const DIMENSIONS = {
   path: "path", channel: "channel", ref_domain: "ref_domain",
   utm_source: "utm_source", utm_medium: "utm_medium", utm_campaign: "utm_campaign",
@@ -760,8 +587,6 @@ const DIMENSIONS = {
   browser: "browser", os: "os", device: "device",
   network: "network", language: "language",
   name: "name",
-  screen: SCREEN_SQL,
-  visitor_type: VISITOR_TYPE_SQL,
 };
 
 // Evaluate the costly whole-session rules once per report request. Reuse the
@@ -837,212 +662,102 @@ function parseRange(url) {
   return { from, to, span: to - from };
 }
 
-async function handleStats(request, env, url) {
-  const site = url.searchParams.get("site");
-  if (!site) return json({ error: "site is required" }, 400);
-
-  const { from, to, span } = parseRange(url);
-  const prevFrom = from - span;
-  const filters = parseFilters(url);
-
-  const excluded = await automationSessionIds(env,site);
-  const cur = buildWhere(site, from, to, filters, excluded);
-  const prev = buildWhere(site, prevFrom, from, filters, excluded);
-
-  // Hourly buckets for short ranges, daily otherwise.
-  const hourly = span <= 2 * 86400;
-  const bucket = hourly ? "%Y-%m-%dT%H:00" : "%Y-%m-%d";
-
-  const breakdown = (key, limit = 12) => {
-    const expr = DIMENSIONS[key];
-    return env.DB.prepare(
-      `SELECT ${expr} AS k, COUNT(DISTINCT visitor_id) AS v
-         FROM events
-        WHERE ${cur.where} AND ${expr} IS NOT NULL AND ${expr} != ''
-        GROUP BY k ORDER BY v DESC LIMIT ${limit}`
-    ).bind(...cur.binds);
-  };
-
-  const edgePage = (direction) =>
-    env.DB.prepare(
-      `SELECT path AS k, COUNT(DISTINCT session_id) AS v FROM (
-         SELECT session_id, path,
-                ROW_NUMBER() OVER (PARTITION BY session_id ORDER BY ts ${direction}, id ${direction}) AS rn
-           FROM events
-          WHERE ${cur.where} AND name = 'pageview' AND path IS NOT NULL
-       ) WHERE rn = 1
-        GROUP BY k ORDER BY v DESC LIMIT 12`
-    ).bind(...cur.binds);
-
-  const statements = [
-    // 0 — headline totals
-    env.DB.prepare(
-      `SELECT COUNT(DISTINCT visitor_id) AS visitors,
-              COUNT(DISTINCT session_id) AS visits,
-              SUM(CASE WHEN name = 'pageview' THEN 1 ELSE 0 END) AS pageviews
-         FROM events WHERE ${cur.where}`
-    ).bind(...cur.binds),
-
-    // 1 — bounces + total duration as raw sums.
-    //
-    // A bounce is a visit that landed on a page and then did nothing: exactly
-    // one pageview and no other event. Two things this deliberately does NOT do:
-    //
-    //   * count pv = 0 visits. A visit with no pageview cannot have bounced —
-    //     nothing was viewed. These are real and common: sessions are cut
-    //     server-side after SESSION_GAP, so a tab left open and returned to an
-    //     hour later opens a fresh visit made only of custom events. Counting
-    //     those as bounces was putting the rate ~45 points too high.
-    //   * treat a single pageview as a bounce on its own. Single-page apps
-    //     never fire a second pageview no matter how engaged the visitor is,
-    //     so pageview-count alone measures the app's routing, not behaviour.
-    //     Any custom event in the visit means something happened.
-    //
-    // `landed` is the denominator: visits that actually began with a pageview.
-    env.DB.prepare(
-      `SELECT SUM(CASE WHEN pv >= 1 AND ev <= 1 THEN 1 ELSE 0 END) AS bounces,
-              SUM(CASE WHEN pv >= 1 THEN 1 ELSE 0 END) AS landed,
-              SUM(dur) AS total_duration,
-              COUNT(*) AS sessions
-         FROM (
-           SELECT session_id,
-                  SUM(CASE WHEN name = 'pageview' THEN 1 ELSE 0 END) AS pv,
-                  COUNT(*) AS ev,
-                  COALESCE((SELECT CAST(q.visible_ms/1000 AS INTEGER) FROM session_quality q WHERE q.session_id=events.session_id),MAX(ts)-MIN(ts)) AS dur
-             FROM events WHERE ${cur.where}
-            GROUP BY session_id
-         )`
-    ).bind(...cur.binds),
-
-    // 2 — previous period, for the % deltas
-    env.DB.prepare(
-      `SELECT COUNT(DISTINCT visitor_id) AS visitors,
-              COUNT(DISTINCT session_id) AS visits,
-              SUM(CASE WHEN name = 'pageview' THEN 1 ELSE 0 END) AS pageviews
-         FROM events WHERE ${prev.where}`
-    ).bind(...prev.binds),
-
-    // 3 — timeseries (all three chartable metrics)
-    env.DB.prepare(
-      `SELECT strftime('${bucket}', ts, 'unixepoch') AS t,
-              COUNT(DISTINCT visitor_id) AS v,
-              COUNT(DISTINCT session_id) AS visits,
-              SUM(CASE WHEN name = 'pageview' THEN 1 ELSE 0 END) AS pageviews
-         FROM events WHERE ${cur.where}
-        GROUP BY t ORDER BY t`
-    ).bind(...cur.binds),
-
-    // 4..13 — dimension breakdowns
-    breakdown("channel"),
-    breakdown("ref_domain"),
-    breakdown("utm_campaign"),
-    breakdown("path"),
-    breakdown("country"),
-    breakdown("region"),
-    breakdown("city"),
-    breakdown("browser"),
-    breakdown("os"),
-    breakdown("device"),
-
-    // 14, 15 — entry / exit pages
-    edgePage("ASC"),
-    edgePage("DESC"),
-
-    // 16 — goals (every non-pageview event)
-    env.DB.prepare(
-      `SELECT name AS k,
-              COUNT(DISTINCT visitor_id) AS visitors,
-              COUNT(*) AS events
-         FROM events
-        WHERE ${cur.where} AND name != 'pageview'
-        GROUP BY k ORDER BY events DESC LIMIT 25`
-    ).bind(...cur.binds),
-
-    // 17..21 — the richer visitor detail
-    breakdown("visitor_type", 2),
-    breakdown("network"),
-    breakdown("language"),
-    breakdown("timezone"),
-    breakdown("screen"),
-    env.DB.prepare(`SELECT COUNT(*) AS suspected,
-      SUM(CASE WHEN reason='known_bot' THEN 1 ELSE 0 END) AS known,
-      SUM(CASE WHEN reason='legacy_unverified' THEN 1 ELSE 0 END) AS legacy,
-      SUM(CASE WHEN qualified=0 AND reason='unconfirmed' THEN 1 ELSE 0 END) AS short,
-      SUM(CASE WHEN qualified=1 THEN 1 ELSE 0 END) AS automated
-      FROM session_quality WHERE site=? AND (qualified=0 OR session_id IN (SELECT value FROM json_each(?))) AND first_ts>=? AND first_ts<? AND last_ts<=?`).bind(site,excluded,from,to,Math.floor(Date.now()/1000)-5),
-    // Revenue is derived from configured fixed-value events, with the same
-    // date, report filters, and qualified-session gate as the other metrics.
-    env.DB.prepare(`SELECT COALESCE(SUM((SELECT amount_minor FROM revenue_rules rr WHERE rr.site=events.site AND rr.event_name=events.name)),0) AS revenue_minor
-      FROM events WHERE ${cur.where} AND name IN (SELECT event_name FROM revenue_rules WHERE site=?)`).bind(...cur.binds, site),
-    env.DB.prepare(`SELECT COALESCE(SUM((SELECT amount_minor FROM revenue_rules rr WHERE rr.site=events.site AND rr.event_name=events.name)),0) AS revenue_minor
-      FROM events WHERE ${prev.where} AND name IN (SELECT event_name FROM revenue_rules WHERE site=?)`).bind(...prev.binds, site),
-    env.DB.prepare(`SELECT strftime('${bucket}', ts, 'unixepoch') AS t,
-      COALESCE(SUM((SELECT amount_minor FROM revenue_rules rr WHERE rr.site=events.site AND rr.event_name=events.name)),0) AS revenue_minor
-      FROM events WHERE ${cur.where} AND name IN (SELECT event_name FROM revenue_rules WHERE site=?) GROUP BY t ORDER BY t`).bind(...cur.binds, site),
-    env.DB.prepare(`SELECT currency FROM revenue_settings WHERE site=?`).bind(site),
-  ];
-
-  const r = await env.DB.batch(statements);
-  const rows = (i) => r[i]?.results || [];
-  const one = (i) => r[i]?.results?.[0] || {};
-
-  const totals = one(0);
-  const rates = one(1);
-  const previous = one(2);
-
-  const visitors = totals.visitors || 0;
-  const visits = totals.visits || 0;
-  const pageviews = totals.pageviews || 0;
-  const revenueMinor = one(23).revenue_minor || 0;
-  const previousRevenueMinor = one(24).revenue_minor || 0;
-  const currency = one(26).currency || "USD";
-  const bounces = rates.bounces || 0;
-  const landed = rates.landed || 0;
-  const sessions = rates.sessions || 0;
-  const totalDuration = rates.total_duration || 0;
-
-  return json({
-    range: { from, to, span },
-    quality: { suspectedBotSessions: one(22).suspected || 0, knownBotSessions: one(22).known || 0, legacyUnverifiedSessions: one(22).legacy || 0, shortUnqualifiedSessions: one(22).short || 0, likelyAutomatedSessions: one(22).automated || 0 },
-    totals: {
-      visitors,
-      visits,
-      pageviews,
-      revenueMinor,
-      viewsPerVisit: visits ? +(pageviews / visits).toFixed(2) : 0,
-      // Over visits that actually landed on a page, not over every visit.
-      bounceRate: landed ? Math.round((bounces / landed) * 100) : 0,
-      duration: sessions ? Math.round(totalDuration / sessions) : 0,
-    },
-    deltas: {
-      visitors: pctChange(visitors, previous.visitors || 0),
-      visits: pctChange(visits, previous.visits || 0),
-      pageviews: pctChange(pageviews, previous.pageviews || 0),
-      revenue: pctChange(revenueMinor, previousRevenueMinor),
-    },
-    timeseries: fillBuckets(rows(3).map((r) => ({ ...r, revenue_minor: r.revenue_minor || 0 })), from, to, hourly),
-    currency,
-    channels: rows(4),
-    sources: rows(5),
-    campaigns: rows(6),
-    pages: rows(7),
-    countries: rows(8),
-    regions: rows(9),
-    cities: rows(10),
-    browsers: rows(11),
-    os: rows(12),
-    devices: rows(13),
-    entry: rows(14),
-    exit: rows(15),
-    goals: rows(16),
-    visitorTypes: rows(17),
-    networks: rows(18),
-    languages: rows(19),
-    timezones: rows(20),
-    screens: rows(21),
-  });
+function shiftDay(day, offset) {
+  const date = new Date(day + 'T00:00:00.000Z');
+  date.setUTCDate(date.getUTCDate() + offset);
+  return date.toISOString().slice(0, 10);
 }
 
+function fillAggregateSeries(rows, fromDay, toDay, monthly) {
+  const byKey = new Map(rows.map((row) => [row.t, row]));
+  const out = [];
+  if (monthly) {
+    const first = fromDay.slice(0, 7).split('-').map(Number);
+    const last = toDay.slice(0, 7).split('-').map(Number);
+    const cursor = new Date(Date.UTC(first[0], first[1] - 1, 1));
+    const end = new Date(Date.UTC(last[0], last[1] - 1, 1));
+    while (cursor <= end) {
+      const key = cursor.toISOString().slice(0, 7);
+      out.push(byKey.get(key) || { t: key, pageviews: 0, actions: 0, revenue_minor: 0 });
+      cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+    }
+  } else {
+    for (let day = fromDay; day <= toDay; day = shiftDay(day, 1)) {
+      out.push(byKey.get(day) || { t: day, pageviews: 0, actions: 0, revenue_minor: 0 });
+    }
+  }
+  return out;
+}
+
+async function handleStats(request, env, url) {
+  const site = url.searchParams.get('site');
+  if (!site || !(await allowedSites(env)).includes(site)) return json({ error: 'unknown site' }, 400);
+
+  const { from, to, span } = parseRange(url);
+  const toDay = new Date(Math.max(from, to - 1) * 1000).toISOString().slice(0, 10);
+  let fromDay = new Date(from * 1000).toISOString().slice(0, 10);
+  if (from === 0) {
+    const earliest = await env.DB.prepare("SELECT MIN(day) AS day FROM daily_analytics WHERE site=?").bind(site).first();
+    fromDay = earliest?.day || toDay;
+  }
+  if (fromDay > toDay) fromDay = toDay;
+  const dayCount = Math.max(1, Math.floor((Date.parse(toDay + 'T00:00:00Z') - Date.parse(fromDay + 'T00:00:00Z')) / 86400000) + 1);
+  const previousTo = shiftDay(fromDay, -1);
+  const previousFrom = shiftDay(previousTo, -(dayCount - 1));
+  const monthly = dayCount > 400;
+  const aggregateWhere = `site=? AND day>=? AND day<=?`;
+  const total = (start, end) => env.DB.prepare(`SELECT
+      COALESCE(SUM(CASE WHEN metric='pageview' AND dimension='all' THEN count ELSE 0 END),0) AS pageviews,
+      COALESCE(SUM(CASE WHEN metric='action' AND dimension='all' THEN count ELSE 0 END),0) AS actions,
+      COALESCE(SUM(CASE WHEN metric='revenue' AND dimension='all' THEN revenue_minor ELSE 0 END),0) AS revenue_minor
+    FROM daily_analytics WHERE ${aggregateWhere}`).bind(site, start, end);
+  const breakdown = (metric, dimension, limit = 15) => env.DB.prepare(`SELECT value AS k,SUM(count) AS v
+    FROM daily_analytics WHERE ${aggregateWhere} AND metric=? AND dimension=?
+    GROUP BY value ORDER BY v DESC LIMIT ${limit}`).bind(site, fromDay, toDay, metric, dimension);
+  const series = env.DB.prepare(`SELECT ${monthly ? "substr(day,1,7)" : 'day'} AS t,
+      SUM(CASE WHEN metric='pageview' AND dimension='all' THEN count ELSE 0 END) AS pageviews,
+      SUM(CASE WHEN metric='action' AND dimension='all' THEN count ELSE 0 END) AS actions,
+      SUM(CASE WHEN metric='revenue' AND dimension='all' THEN revenue_minor ELSE 0 END) AS revenue_minor
+    FROM daily_analytics WHERE ${aggregateWhere} GROUP BY t ORDER BY t`).bind(site, fromDay, toDay);
+
+  const result = await env.DB.batch([
+    total(fromDay, toDay), total(previousFrom, previousTo), series,
+    breakdown('pageview', 'channel'), breakdown('pageview', 'ref_domain'),
+    breakdown('pageview', 'path', 30), breakdown('pageview', 'country'),
+    breakdown('pageview', 'browser'), breakdown('pageview', 'os'), breakdown('pageview', 'device'),
+    breakdown('action', 'name', 40),
+    env.DB.prepare('SELECT currency FROM revenue_settings WHERE site=?').bind(site),
+  ]);
+  const one = (index) => result[index]?.results?.[0] || {};
+  const rows = (index) => result[index]?.results || [];
+  const current = one(0);
+  const previous = one(1);
+  const goals = rows(10).map((row) => ({ k: row.k, events: row.v }));
+  return json({
+    aggregateOnly: true,
+    range: { from, to, span, fromDay, toDay, granularity: monthly ? 'month' : 'day' },
+    totals: {
+      pageviews: current.pageviews || 0,
+      actions: current.actions || 0,
+      revenueMinor: current.revenue_minor || 0,
+    },
+    deltas: {
+      pageviews: pctChange(current.pageviews || 0, previous.pageviews || 0),
+      actions: pctChange(current.actions || 0, previous.actions || 0),
+      revenue: pctChange(current.revenue_minor || 0, previous.revenue_minor || 0),
+    },
+    timeseries: fillAggregateSeries(rows(2), fromDay, toDay, monthly),
+    currency: one(11).currency || 'EUR',
+    channels: rows(3),
+    sources: rows(4),
+    pages: rows(5),
+    countries: rows(6),
+    browsers: rows(7),
+    os: rows(8),
+    devices: rows(9),
+    goals,
+  });
+}
 /* ---- individual visits: the most detail available per person -------- */
 
 async function handleVisits(env, url) {
@@ -1169,7 +884,7 @@ async function handleJourney(env, url) {
 
 /**
  * SQL's GROUP BY only returns buckets that actually had an event, so a
- * single visitor at 2pm on an otherwise empty day produces one floating
+ * single page view in the middle of an otherwise empty day produces one floating
  * point with nothing around it instead of a flat line that jumps when it
  * happens. Fill every bucket in [from, to) with zero counts first, then
  * overlay whatever the query actually found.

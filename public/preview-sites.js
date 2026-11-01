@@ -1,19 +1,16 @@
 /* Preview sites are local-only simulations. They never write analytics records. */
 const PREVIEW_STORAGE = 'lucid-preview-sites-v1';
 const PREVIEW_FIELDS = [
-  ['visitors','Unique visitors',1200,1000000000,1],
-  ['visits','Total visits',1500,1000000000,1],
-  ['pageviews','Total pageviews',3200,1000000000,1],
+  ['pageviews','Page views',3200,1000000000,1],
+  ['actions','Product actions',420,1000000000,1],
   ['revenue','Revenue (USD)',0,1000000000,.01],
-  ['bounceRate','Bounce rate (%)',40,100,1],
-  ['duration','Visit duration (seconds)',90,86400,1],
   ['growth','Change from previous period (%)',12,10000,.1],
 ];
 function readPreviewSites() {
   try {
     const list = JSON.parse(localStorage.getItem(PREVIEW_STORAGE) || '[]');
     if (!Array.isArray(list)) return [];
-    return list.filter(p => p && typeof p.id === 'string' && typeof p.domain === 'string' &&
+    return list.map(p => p && ({...p, actions:Number.isFinite(p.actions) ? p.actions : Math.max(0,p.visits || 0)})).filter(p => p && typeof p.id === 'string' && typeof p.domain === 'string' &&
       PREVIEW_FIELDS.every(([key,,fallback,max]) => Number.isFinite(p[key]) && p[key] >= (key === 'growth' ? -100 : 0) && p[key] <= max));
   } catch { return []; }
 }
@@ -21,7 +18,7 @@ function currentPreview() {
   return state.site?.startsWith('preview:') ? readPreviewSites().find(p => 'preview:' + p.id === state.site) : null;
 }
 function previewCards() {
-  return readPreviewSites().map(p => ({domain:p.domain,previewId:p.id,visitors24h:p.visitors,delta:p.growth,spark:[]}));
+  return readPreviewSites().map(p => ({domain:p.domain,previewId:p.id,pageviewsToday:p.pageviews,delta:p.growth,spark:[]}));
 }
 function previewStats(p) {
   // Split the entered totals into a deterministic illustrative daily trend.
@@ -36,12 +33,14 @@ function previewStats(p) {
     for(let i=0;i<remaining;i++) values[i%count]++;
     return values;
   };
-  const visitors=distribute(p.visitors), visits=distribute(p.visits), pageviews=distribute(p.pageviews), revenue=distribute(Math.round(p.revenue*100));
+  const pageviews=distribute(p.pageviews), actions=distribute(p.actions), revenue=distribute(Math.round(p.revenue*100));
   return {
-    currency:'USD',quality:{},
-    totals:{visitors:p.visitors,visits:p.visits,pageviews:p.pageviews,revenueMinor:Math.round(p.revenue*100),viewsPerVisit:p.visits ? +(p.pageviews/p.visits).toFixed(2) : 0,bounceRate:p.bounceRate,duration:p.duration},
-    deltas:{visitors:p.growth,visits:p.growth,pageviews:p.growth,revenue:p.growth},
-    timeseries:weights.map((_,i)=>({t:new Date((start+(end-start)*(i+.5)/count)*1000).toISOString().slice(0,10),v:visitors[i],visits:visits[i],pageviews:pageviews[i],revenue_minor:revenue[i]})),
+    currency:'USD',
+    totals:{pageviews:p.pageviews,actions:p.actions,revenueMinor:Math.round(p.revenue*100)},
+    deltas:{pageviews:p.growth,actions:p.growth,revenue:p.growth},
+    goals:[],
+    channels:[],sources:[],pages:[],countries:[],browsers:[],os:[],devices:[],
+    timeseries:weights.map((_,i)=>({t:new Date((start+(end-start)*(i+.5)/count)*1000).toISOString().slice(0,10),pageviews:pageviews[i],actions:actions[i],revenue_minor:revenue[i]})),
   };
 }
 function previewSiteModal(id) {
@@ -74,7 +73,6 @@ function previewSiteModal(id) {
       if(!Number.isFinite(value) || value<(key==='growth' ? -100 : 0) || value>max || (step===1 && !Number.isInteger(value))) {error('Enter valid numbers within the limits shown.');return;}
       next[key]=value;
     }
-    if(next.visitors>next.visits || next.visits>next.pageviews) {error('Visits must be at least the number of visitors, and pageviews must be at least the number of visits.');return;}
     const sites=readPreviewSites().filter(p=>p.id!==next.id);sites.push(next);
     try { localStorage.setItem(PREVIEW_STORAGE,JSON.stringify(sites)); }
     catch {error('This browser could not save the preview. Enable site storage and try again.');return;}
