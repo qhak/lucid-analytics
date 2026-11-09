@@ -711,9 +711,12 @@ async function handleStats(request, env, url) {
       COALESCE(SUM(CASE WHEN metric='action' AND dimension='all' THEN count ELSE 0 END),0) AS actions,
       COALESCE(SUM(CASE WHEN metric='revenue' AND dimension='all' THEN revenue_minor ELSE 0 END),0) AS revenue_minor
     FROM daily_analytics WHERE ${aggregateWhere}`).bind(site, start, end);
-  const breakdown = (metric, dimension, limit = 15) => env.DB.prepare(`SELECT value AS k,SUM(count) AS v
-    FROM daily_analytics WHERE ${aggregateWhere} AND metric=? AND dimension=?
-    GROUP BY value ORDER BY v DESC LIMIT ${limit}`).bind(site, fromDay, toDay, metric, dimension);
+  const breakdown = (metric, dimension, limit = 15) => {
+    const limitSql = limit == null ? "" : ` LIMIT ${limit}`;
+    return env.DB.prepare(`SELECT value AS k,SUM(count) AS v
+      FROM daily_analytics WHERE ${aggregateWhere} AND metric=? AND dimension=?
+      GROUP BY value ORDER BY v DESC${limitSql}`).bind(site, fromDay, toDay, metric, dimension);
+  };
   const series = env.DB.prepare(`SELECT ${monthly ? "substr(day,1,7)" : 'day'} AS t,
       SUM(CASE WHEN metric='pageview' AND dimension='all' THEN count ELSE 0 END) AS pageviews,
       SUM(CASE WHEN metric='action' AND dimension='all' THEN count ELSE 0 END) AS actions,
@@ -723,7 +726,7 @@ async function handleStats(request, env, url) {
   const result = await env.DB.batch([
     total(fromDay, toDay), total(previousFrom, previousTo), series,
     breakdown('pageview', 'channel'), breakdown('pageview', 'ref_domain'),
-    breakdown('pageview', 'path', 30), breakdown('pageview', 'country'),
+    breakdown('pageview', 'path', 30), breakdown('pageview', 'country', null),
     breakdown('pageview', 'browser'), breakdown('pageview', 'os'), breakdown('pageview', 'device'),
     breakdown('action', 'name', 40),
     env.DB.prepare('SELECT currency FROM revenue_settings WHERE site=?').bind(site),
