@@ -86,7 +86,8 @@ function previewSiteModal(id) {
 function previewCardMenu(button, site) {
   const menu=document.createElement('div');menu.className='cardmenu';
   menu.innerHTML='<button data-a="open">Open preview</button><button data-a="edit">Edit numbers</button><button data-a="remove" class="danger">Remove preview</button>';
-  button.closest('.sitecard').appendChild(menu);
+  if (button.closest('.portfolio-action-wrap')) attachPortfolioMenu(button,menu);
+  else button.closest('.sitecard').appendChild(menu);
   menu.addEventListener('click',e=>{
     e.stopPropagation();
     const action=e.target.closest('button')?.dataset.a;

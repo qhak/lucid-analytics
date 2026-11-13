@@ -18,11 +18,12 @@
 </script>
 <link rel="stylesheet" href="/dashboard.css">
 <link rel="stylesheet" href="/personal-ui.css">
+<link rel="stylesheet" href="/portfolio.css">
 </head>
 <body>
 <div class="wrap">
   <div class="topbar">
-    <button class="brand" id="homebtn" aria-label="Lucid Analytics home"><img class="mark" src="/lucid-mark.svg" alt=""><span class="brand-name">Lucid Analytics</span></button>
+    <button class="brand" id="homebtn" aria-label="Lucid Analytics home"><img class="mark" src="/lucid-mark.svg" alt=""><span class="brand-name">Lucid <span>Analytics</span></span></button>
     <div style="display:flex;gap:4px">
       <button class="theme-toggle" id="themebtn" type="button" aria-label="Switch theme"></button>
       <button class="navlink" id="excludedbtn">Excluded Places</button>
@@ -62,6 +63,7 @@ function setTheme(theme) {
   try { localStorage.setItem('lucid-theme', theme); } catch {}
   updateThemeButton();
   if (state.site && state.data) { renderChart(); drawMap(); }
+  else if ($('portfolio')) renderPortfolio(state.sitesList);
   else if ($('cards')) {
     const query = $('sitesearch')?.value.trim().toLowerCase() || '';
     renderCards(state.sitesList.filter(site => site.domain.includes(query)));
@@ -138,6 +140,7 @@ state.range = rangeFor("28d");
 
 function route() {
   stopPoll();
+  closeMenus();
   const hash = decodeURIComponent(location.hash.replace(/^#\/?/, ""));
   if (hash) { state.site = hash; showDashboard(); }
   else { state.site = null; showSites(); }
@@ -156,7 +159,7 @@ async function fetchSites() {
   return state.sitesList;
 }
 
-async function showSites() {
+async function showSitesLegacy() {
   const host = $("view");
   host.innerHTML = '<div class="sites-head"><div class="eyebrow">Your workspace</div><h1>Websites</h1><p>A clear view of the people visiting your websites.</p></div><div class="empty">Loading…</div>';
   let sites;
@@ -262,6 +265,149 @@ function renderCards(sites) {
   sites.forEach((s, i) => drawSpark(host.querySelector('[data-spark="' + i + '"]'), s.spark));
 }
 
+async function showSites() {
+  const host = $("view");
+  host.innerHTML = '<div class="sites-head"><div class="eyebrow">Your workspace</div><h1>All websites</h1><p>Page views and daily activity in one live view.</p></div><div class="empty">Loading your portfolio…</div>';
+  let sites;
+  try { sites = await fetchSites(); }
+  catch (e) { host.innerHTML = '<div class="errbox">' + esc(e.message) + "</div>"; return; }
+  // If the user opened a site while the list was loading, leave that dashboard in control.
+  if (state.site) return;
+  state.sitesList = sites;
+  host.innerHTML =
+    '<div class="sites-head"><div class="eyebrow">Your workspace</div><h1>All websites</h1><p>Page views and daily activity in one live view.</p></div>' +
+    '<section class="portfolio-summary" aria-label="Combined website activity">' +
+      '<article class="portfolio-stat"><div class="portfolio-label">Page views today · UTC</div><div class="portfolio-value" id="portfolio-pageviews">0</div><div class="portfolio-change flat" id="portfolio-change">Waiting for activity</div></article>' +
+      '<article class="portfolio-stat"><div class="portfolio-label">Websites in Lucid</div><div class="portfolio-value" id="portfolio-count">0</div><div class="portfolio-sub">Current and historical properties</div></article>' +
+      '<article class="portfolio-stat"><div class="portfolio-label">Sites with page views</div><div class="portfolio-value" id="portfolio-active">0</div><div class="portfolio-sub">Today · UTC</div></article>' +
+    '</section>' +
+    '<section class="portfolio-chart-card"><div class="portfolio-chart-heading"><div><h2>Page views across sites</h2><p>Daily totals · last 7 days · UTC</p></div><span class="portfolio-live"><span class="dot"></span> Updates every 30 seconds</span></div>' +
+      '<canvas id="portfolio-spark" width="900" height="80" role="img" aria-label="Daily page views summed across tracked websites"></canvas></section>' +
+    '<div class="sites-toolbar portfolio-toolbar"><input class="searchbox" id="sitesearch" aria-label="Search websites" placeholder="Search websites…">' +
+      '<div class="toolbar-right"><span class="liveind" title="Refreshes automatically every 30 seconds"><span class="dot"></span><span id="liveago">Live</span></span>' +
+        '<button class="btn primary" id="addsite">Add website</button><button class="btn" id="addpreview">Add preview site</button></div></div>' +
+    '<section class="portfolio-table-card" id="portfolio"><div class="portfolio-table-heading"><div><h2>Website activity</h2><p id="portfolio-table-caption">Today compared with yesterday</p></div></div>' +
+      '<div class="portfolio-table-scroll"><table class="portfolio-table" aria-label="Page views across all websites"><thead><tr>' +
+        '<th scope="col">WEBSITE</th><th scope="col">PAGEVIEWS · TODAY</th><th scope="col">PREVIOUS DAY</th><th scope="col">CHANGE</th><th scope="col">7-DAY TREND</th><th scope="col"><span class="sr-only">ACTIONS</span></th>' +
+      '</tr></thead><tbody id="portfolio-rows"></tbody></table><div class="portfolio-empty" id="portfolio-empty" hidden></div></div>' +
+      '<div class="portfolio-foot"><span id="portfolio-shown"></span><span>Click a site to open its detailed dashboard.</span></div></section>' +
+    '<p class="note portfolio-note">Portfolio totals sum daily pageview counts across sites. They are aggregate counts, not deduplicated people. Preview sites are excluded from live totals.</p>';
+
+  renderPortfolio(sites);
+  markUpdated();
+  $("sitesearch").addEventListener("input", () => renderPortfolio(state.sitesList));
+  $("addsite").addEventListener("click", () => addSiteModal());
+  $("addpreview").addEventListener("click", () => previewSiteModal());
+  startPoll(async () => {
+    state.sitesList = await fetchSites().catch(() => state.sitesList);
+    if (state.site || !$("portfolio")) return;
+    renderPortfolio(state.sitesList);
+    markUpdated();
+  });
+}
+
+function portfolioChange(current, previous) {
+  if (!previous) return current
+    ? { label: "New activity vs. yesterday", className: "up" }
+    : { label: "No page views in either period", className: "flat" };
+  const pct = Math.round(((current - previous) / previous) * 1000) / 10;
+  return {
+    label: (pct > 0 ? "+" : pct < 0 ? "−" : "") + Math.abs(pct).toFixed(1) + "% vs. yesterday",
+    className: pct > 0 ? "up" : pct < 0 ? "down" : "flat",
+  };
+}
+
+function renderPortfolio(sites = state.sitesList) {
+  const body = $("portfolio-rows");
+  if (!body) return;
+  const tracked = sites.filter((site) => !site.previewId);
+  const query = $("sitesearch")?.value.trim().toLowerCase() || "";
+  const visible = sites.filter((site) => site.domain.toLowerCase().includes(query)).slice().sort((a, b) => {
+    if (!!a.previewId !== !!b.previewId) return a.previewId ? 1 : -1;
+    return (b.pageviewsToday || 0) - (a.pageviewsToday || 0) || a.domain.localeCompare(b.domain);
+  });
+  const pageviews = tracked.reduce((sum, site) => sum + (site.pageviewsToday || 0), 0);
+  const previous = tracked.reduce((sum, site) => sum + (site.prevDay || 0), 0);
+  const activeSites = tracked.filter((site) => (site.pageviewsToday || 0) > 0).length;
+  const change = portfolioChange(pageviews, previous);
+  $("portfolio-pageviews").textContent = fmt(pageviews);
+  $("portfolio-count").textContent = fmt(tracked.length);
+  $("portfolio-active").textContent = fmt(activeSites);
+  $("portfolio-change").textContent = change.label;
+  $("portfolio-change").className = "portfolio-change " + change.className;
+  $("portfolio-table-caption").textContent = tracked.length
+    ? "Today compared with yesterday · UTC"
+    : "Add a website to start collecting daily totals";
+  $("portfolio-shown").textContent = "Showing " + visible.length + " of " + sites.length + " websites";
+
+  const daily = new Map();
+  for (const site of tracked) {
+    for (const point of site.spark || []) daily.set(point.t, (daily.get(point.t) || 0) + (point.v || 0));
+  }
+  drawSpark($("portfolio-spark"), [...daily.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([t, v]) => ({ t, v })));
+
+  body.innerHTML = visible.map((site, index) => {
+    const preview = !!site.previewId;
+    const route = preview ? "preview:" + site.previewId : site.domain;
+    const rowChange = preview ? { label: "Preview", className: "flat" } : portfolioChange(site.pageviewsToday || 0, site.prevDay || 0);
+    return '<tr><td><div class="portfolio-name"><a class="portfolio-site" href="#/' + encodeURIComponent(route) + '">' + esc(site.domain) + '</a>' +
+      (preview ? '<span class="preview-badge">Preview</span>' : '') + '</div></td>' +
+      '<td class="tabular">' + (preview ? "—" : fmt(site.pageviewsToday || 0)) + '</td>' +
+      '<td class="tabular">' + (preview ? "—" : fmt(site.prevDay || 0)) + '</td>' +
+      '<td class="portfolio-row-change ' + rowChange.className + '">' + esc(rowChange.label.replace(" vs. yesterday", "")) + '</td>' +
+      '<td>' + (preview ? '<span class="portfolio-sample">Sample only</span>' : '<canvas class="portfolio-row-spark" data-spark="' + index + '" width="150" height="30" role="img" aria-label="' + esc(site.domain) + ' seven-day pageview trend"></canvas>') + '</td>' +
+      '<td><div class="portfolio-action-wrap"><button class="dots portfolio-dots" data-site-menu="' + index + '" aria-label="Actions for ' + esc(site.domain) + '">⋮</button></div></td></tr>';
+  }).join("");
+  $("portfolio-empty").hidden = visible.length > 0;
+  $("portfolio-empty").textContent = sites.length ? "No websites match your search." : "No websites yet. Add a website above to start tracking visits.";
+  visible.forEach((site, index) => {
+    if (!site.previewId) drawSpark(body.querySelector('[data-spark="' + index + '"]'), site.spark);
+  });
+  body.querySelectorAll("[data-site-menu]").forEach((button) => button.addEventListener("click", (event) => {
+    event.stopPropagation();
+    closeMenus();
+    const site = visible[Number(button.dataset.siteMenu)];
+    if (site.previewId) previewCardMenu(button, site);
+    else portfolioSiteMenu(button, site);
+  }));
+}
+
+function portfolioSiteMenu(button, site) {
+  const menu = document.createElement("div");
+  menu.className = "cardmenu";
+  menu.innerHTML = '<button data-a="open">Open dashboard</button><button data-a="snippet">Copy embed snippet</button><button data-a="remove" class="danger">Remove site</button>';
+  attachPortfolioMenu(button, menu);
+  menu.addEventListener("click", async (event) => {
+    event.stopPropagation();
+    const action = event.target.closest("button")?.dataset.a;
+    if (action === "open") location.hash = "/" + site.domain;
+    if (action === "snippet") {
+      await navigator.clipboard.writeText(snippetFor(site.domain));
+      event.target.textContent = "Copied!";
+      setTimeout(closeMenus, 700);
+    }
+    if (action === "remove" && confirm("Remove " + site.domain + "? Existing aggregate totals are kept, but new events stop.")) {
+      await fetch("/api/sites?domain=" + encodeURIComponent(site.domain), { method: "DELETE" });
+      state.sitesList = await fetchSites().catch(() => state.sitesList);
+      closeMenus();
+      renderPortfolio(state.sitesList);
+      markUpdated();
+    }
+  });
+}
+
+function attachPortfolioMenu(button, menu) {
+  if (!button.closest(".portfolio-action-wrap")) {
+    button.closest(".sitecard").appendChild(menu);
+    return;
+  }
+  const rect = button.getBoundingClientRect();
+  menu.style.position = "fixed";
+  menu.style.right = Math.max(8, window.innerWidth - rect.right) + "px";
+  menu.style.top = Math.max(8, Math.min(window.innerHeight - 150, rect.bottom + 4)) + "px";
+  document.body.appendChild(menu);
+}
+
 function snippetFor(domain) {
   return '<script defer src="' + location.origin + '/tracker.js"><' + '/script> <!-- ' + domain + ' -->';
 }
@@ -269,7 +415,7 @@ function snippetFor(domain) {
 function drawSpark(canvas, spark) {
   if (!canvas) return;
   const ratio = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth || 300, h = 52;
+  const w = canvas.clientWidth || 300, h = canvas.clientHeight || 52;
   canvas.width = w * ratio; canvas.height = h * ratio;
   const ctx = canvas.getContext("2d");
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
@@ -287,7 +433,8 @@ function drawSpark(canvas, spark) {
   const y = (v) => h - 6 - (v / max) * (h - 12);
 
   const grad = ctx.createLinearGradient(0, 0, 0, h);
-  grad.addColorStop(0, accA(.12));
+  grad.addColorStop(0, accA(.2));
+  grad.addColorStop(.7, accA(.04));
   grad.addColorStop(1, accA(0));
   ctx.beginPath();
   ctx.moveTo(0, h);
@@ -554,7 +701,7 @@ function siteMenu() {
   const menu = document.createElement("div");
   menu.className = "sitemenu";
   menu.innerHTML =
-    '<button class="back" data-d="">← Back to all sites</button>' +
+    '<button class="back" data-d="">← All websites overview</button>' +
     state.sitesList.map((s) =>
       '<button data-d="' + esc(s.previewId ? 'preview:' + s.previewId : s.domain) + '">' + esc(s.domain) + (s.previewId ? ' · Preview' : '') +
       (s.domain === state.site ? " ✓" : "") + "</button>").join("");
@@ -1043,9 +1190,9 @@ function renderChart() {
   // repeated "1, 1, 1, 0" labels that scaling to 4 divisions would produce).
   const divisions = niceMax <= 4 ? niceMax : 4;
 
-  ctx.strokeStyle = themeColor("--line");
+  ctx.strokeStyle = themeColor("--line-soft") || themeColor("--line");
   ctx.fillStyle = themeColor("--mute");
-  ctx.font = "11px Inter,sans-serif";
+  ctx.font = "500 11px Inter,sans-serif";
   ctx.lineWidth = 1;
   for (let i = 0; i <= divisions; i++) {
     const y = Math.round(padT + (plotH / divisions) * i) + 0.5;
@@ -1065,7 +1212,8 @@ function renderChart() {
   const y = (v) => padT + plotH - (v / niceMax) * plotH;
 
   const grad = ctx.createLinearGradient(0, padT, 0, padT + plotH);
-  grad.addColorStop(0, accA(.12));
+  grad.addColorStop(0, accA(.2));
+  grad.addColorStop(.7, accA(.04));
   grad.addColorStop(1, accA(0));
   ctx.beginPath();
   ctx.moveTo(x(0), padT + plotH);
@@ -1078,19 +1226,25 @@ function renderChart() {
   ctx.beginPath();
   values.forEach((v, i) => (i ? ctx.lineTo(x(i), y(v)) : ctx.moveTo(x(i), y(v))));
   ctx.strokeStyle = themeColor("--accent");
-  ctx.lineWidth = 1.7;
+  ctx.lineWidth = 2.25;
   ctx.lineJoin = "round";
+  ctx.lineCap = "round";
   ctx.stroke();
 
   const li = values.length - 1;
+  ctx.beginPath(); ctx.arc(x(li), y(values[li]), 6, 0, Math.PI * 2);
+  ctx.fillStyle = accA(.18); ctx.fill();
   ctx.beginPath(); ctx.arc(x(li), y(values[li]), 3.5, 0, Math.PI * 2);
   ctx.fillStyle = themeColor("--accent"); ctx.fill();
 
   ctx.fillStyle = themeColor("--mute");
-  ctx.textAlign = "center";
   const markCount = Math.max(2, Math.min(6, Math.floor(w / 160)));
   const marks = Array.from({length:markCount}, (_,i) => Math.round(li * i / (markCount - 1)));
-  new Set(marks).forEach((i) => ctx.fillText(shortDate(series[i].t), x(i), h - 9));
+  // Pin the outer labels to the plot edges so the last date is never clipped.
+  new Set(marks).forEach((i) => {
+    ctx.textAlign = li && i === li ? "right" : i === 0 && li ? "left" : "center";
+    ctx.fillText(shortDate(series[i].t), li && i === li ? w - padR : x(i), h - 9);
+  });
   canvas.onpointermove = event => {
     const rect = canvas.getBoundingClientRect();
     const pointerX = event.clientX - rect.left;

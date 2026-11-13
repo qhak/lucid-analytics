@@ -10,6 +10,7 @@ Lucid collects page views and custom events through a lightweight script, then s
 
 The dashboard includes:
 
+- A portfolio overview with combined daily page views and per-site activity
 - Daily page-view and product-action totals, with optional event-based revenue totals
 - Independent breakdowns for referrer domain, channel, page, country, browser, operating system and device
 - Daily and monthly charts, plus retained all-time totals

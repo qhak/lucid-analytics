@@ -1,8 +1,17 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
-  <path d="M23.75 7.1a12 12 0 1 0 1.54 11.95" stroke="#6254dc" stroke-width="2.5" stroke-linecap="round"/>
-  <path d="m8.2 20.5 6.1-6.2 4.2 3.1 5.2-7.1" stroke="#9588f4" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/>
-  <circle cx="8.2" cy="20.5" r="1.35" fill="#9588f4"/>
-  <circle cx="14.3" cy="14.3" r="1.35" fill="#9588f4"/>
-  <circle cx="18.5" cy="17.4" r="1.35" fill="#9588f4"/>
-  <circle cx="23.7" cy="10.3" r="1.35" fill="#9588f4"/>
+  <defs>
+    <linearGradient id="lucid-tile" x1="4" y1="2" x2="28" y2="30" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#7c83ff"/>
+      <stop offset=".55" stop-color="#5145e6"/>
+      <stop offset="1" stop-color="#3a2fc4"/>
+    </linearGradient>
+    <linearGradient id="lucid-sheen" x1="16" y1="0" x2="16" y2="16" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#fff" stop-opacity=".22"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+  <rect width="32" height="32" rx="8.5" fill="url(#lucid-tile)"/>
+  <rect width="32" height="32" rx="8.5" fill="url(#lucid-sheen)"/>
+  <path d="M8 21.5 13.2 15.6l4 3.1L24 10.5" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="24" cy="10.5" r="2.1" fill="#fff"/>
 </svg>
