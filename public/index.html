@@ -18,6 +18,8 @@
 </script>
 <link rel="stylesheet" href="/dashboard.css">
 <link rel="stylesheet" href="/personal-ui.css">
+<link rel="stylesheet" href="/vendor/rrweb-player.css">
+<link rel="stylesheet" href="/visitors.css">
 </head>
 <body>
 <div class="wrap">
@@ -34,7 +36,10 @@
 <div class="overlay" id="modal"></div>
 
 <script src="/world-data.js"></script>
+<script src="/country-tiers.js"></script>
 <script src="/preview-sites.js"></script>
+<script src="/vendor/rrweb-player.min.js" defer></script>
+<script src="/visitors.js"></script>
 <script>
 "use strict";
 
@@ -487,6 +492,7 @@ function showDashboard() {
         <div class="tabs" data-group="geo">
           <button class="on" data-key="map">Map</button>
           <button data-key="countries">Countries</button>
+          <button data-key="tiers">Tiers</button>
         </div>
         <div id="geo"></div>
       </div>
@@ -503,8 +509,13 @@ function showDashboard() {
         <h2 class="panel-heading">Product actions</h2>
         <div id="ev"></div>
       </div>
+      <div class="panel wide" id="visitorspanel">
+        <h2 class="panel-heading">Visitors</h2>
+        <div class="tabs"><button class="on" aria-pressed="true">Recorded visits</button></div>
+        <div id="visitors"></div>
+      </div>
     </div>
-    <p class="note dashboard-note">Daily aggregate counts only. New records contain no visitor IDs or visit histories. Historical visit-level records collected before this change remain stored.</p>`;
+    <p class="note dashboard-note">Charts above are daily aggregate counts. Visitors are individual recorded visits, kept for 30 days; click one to replay it.</p>`;
 
   const preview = currentPreview();
   $("sitename").textContent = preview ? preview.domain : state.site;
@@ -523,19 +534,21 @@ function showDashboard() {
   $("revenuesettings").addEventListener("click", revenueSettingsModal);
   $("datebtn").addEventListener("click", (e) => { e.stopPropagation(); dateMenu(); });
 
-  document.querySelectorAll(".tabs").forEach((bar) =>
-    bar.addEventListener("click", (e) => {
-      const btn = e.target.closest("button");
-      if (!btn) return;
-      if (!btn.dataset.key) return;
-      active[bar.dataset.group] = btn.dataset.key;
-      bar.querySelectorAll("button").forEach((b) => b.classList.toggle("on", b === btn));
-      renderPanel(bar.dataset.group);
-    })
-  );
-
-  document.querySelectorAll('.tabs[data-group]').forEach(bar => {
+  document.querySelectorAll(".tabs[data-group]").forEach((bar) => {
     const group = bar.dataset.group;
+    const syncTabs = () => bar.querySelectorAll("button[data-key]").forEach((button) => {
+      const selected = button.dataset.key === active[group];
+      button.classList.toggle("on", selected);
+      button.setAttribute("aria-pressed", String(selected));
+    });
+    syncTabs();
+    bar.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-key]");
+      if (!btn) return;
+      active[group] = btn.dataset.key;
+      syncTabs();
+      renderPanel(group);
+    });
     if (group === 'ev') return;
     const button = document.createElement('button');
     button.className = 'expand-report'; button.type = 'button';
@@ -545,8 +558,10 @@ function showDashboard() {
     bar.appendChild(button);
   });
   if (!state.sitesList.length) fetchSites().catch(() => {});
+  if (preview) $('visitorspanel').remove();
+  else window.LucidVisitors.mount($('visitors'), () => ({ site: state.site, from: state.range.from, to: state.range.to }));
   resetAndLoad();
-  if (!preview) startPoll(load);
+  if (!preview) startPoll(() => { load(); window.LucidVisitors.refresh(); });
 }
 
 function siteMenu() {
@@ -854,6 +869,7 @@ async function load() {
 function resetAndLoad() {
   state.journeyStart = null;
   load();
+  if ($('visitors')) window.LucidVisitors.refresh();
 }
 
 /* ---- auto-refresh: dashboard polls for new events while it's open ---- */
@@ -1125,6 +1141,52 @@ function shortDate(t) {
 
 /* ---- panels ---- */
 
+function countryLabel(iso) {
+  const tier = countryTier(iso);
+  const icon = flag(iso);
+  return '<span class="lbl country-label">' +
+    (icon ? '<span class="country-flag" aria-hidden="true">' + icon + '</span>' : '') +
+    (tier ? '<span class="country-tier" data-tier="' + tier + '">T' + tier + '</span>' : '') +
+    '<span class="country-name">' + esc(countryName(iso)) + '</span></span>';
+}
+
+function renderTiers(host) {
+  const total = state.data.totals.pageviews;
+  if (!total) {
+    host.innerHTML = '<div class="empty">Nothing recorded in this range.</div>';
+    return;
+  }
+
+  const counts = [total, 0, 0, 0];
+  for (const { k, v } of state.data.countries || []) {
+    const tier = countryTier(k);
+    if (!tier) continue;
+    counts[tier] += v;
+    counts[0] -= v;
+  }
+
+  const stops = [];
+  let cumulative = 0;
+  const percent = new Intl.NumberFormat(undefined, { style: 'percent', maximumFractionDigits: 1 });
+  const legend = [1, 2, 3, 0].map((tier) => {
+    const count = counts[tier];
+    const share = count / total;
+    if (count > 0) {
+      const start = cumulative / total * 100;
+      cumulative += count;
+      const end = cumulative / total * 100;
+      stops.push('var(--tier-' + tier + '-fill) ' + start + '% ' + end + '%');
+    }
+    return '<li><span class="tier-key" data-tier="' + tier + '"><span class="tier-swatch" aria-hidden="true"></span>' +
+      (tier ? 'T' + tier : 'Unrated') + '</span> <span class="tier-count">' + fmt(count) +
+      '</span> <strong>' + (share > 0 && share < 0.001 ? '&lt;' + percent.format(0.001) : percent.format(share)) + '</strong></li>';
+  }).join('');
+
+  host.innerHTML = '<p class="tier-caption">Page views by country tier</p>' +
+    '<div class="tier-report"><div class="tier-pie" aria-hidden="true" style="background-image:conic-gradient(' +
+    stops.join(', ') + ')"></div><ul class="tier-legend tabular" role="list">' + legend + '</ul></div>';
+}
+
 function renderPanel(group, options = {}) {
   const key = options.key || active[group];
   const host = options.host || $(group);
@@ -1139,6 +1201,7 @@ function renderPanel(group, options = {}) {
     requestAnimationFrame(drawMap);
     return;
   }
+  if (key === "tiers") return renderTiers(host);
   if (key === "goals") return renderGoals(host);
   if (key === "explore") return renderExplore(host);
   if (key === "visits") return renderVisits(host);
@@ -1158,7 +1221,6 @@ function renderPanel(group, options = {}) {
 
   const showPct = group === "tech";
   const total = state.data.totals.pageviews || 1;
-  const disp = key === "countries" ? countryName : key === "languages" ? languageName : null;
   const max = Math.max(...list.map((r) => r.v || 0), 1);
 
   host.innerHTML =
@@ -1167,7 +1229,8 @@ function renderPanel(group, options = {}) {
     '<div class="rows">' + list.map((r) =>
       '<div class="row">' +
       '<div class="bar" style="width:' + ((r.v || 0) / max) * 100 + '%"></div>' +
-      '<span class="lbl">' + esc(disp ? disp(r.k) : r.k) + "</span>" +
+      (key === 'countries' ? countryLabel(r.k) :
+        '<span class="lbl">' + esc(key === 'languages' ? languageName(r.k) : r.k) + '</span>') +
       '<span class="nums"><span class="val tabular">' + fmt(r.v) + "</span>" +
       (showPct ? '<span class="pct tabular">' + ((r.v / total) * 100).toFixed(1) + "%</span>" : "") +
       "</span></div>").join("") + "</div>";
@@ -1178,10 +1241,22 @@ function expandReport(group) {
   if (!state.data) return;
   const key = active[group] === 'map' ? 'countries' : active[group];
   const title = document.querySelector('.tabs[data-group="'+group+'"] [data-key="'+key+'"]')?.textContent || 'Report';
+  const isTiers = key === 'tiers';
   $('modal').classList.add('open');
-  $('modal').innerHTML='<section class="modal report-modal" role="dialog" aria-modal="true" aria-labelledby="report-title"><div class="report-title"><h3 id="report-title">'+esc(title)+'</h3><button class="report-close" id="closereport" aria-label="Close report">×</button></div><div class="report-tools"><input id="reportsearch" class="searchbox" aria-label="Search report" placeholder="Search…"><select id="reportsort" aria-label="Sort report"><option value="visitors">Most views</option><option value="name">Name A–Z</option></select></div><div id="expandedreport"></div><p class="note">Daily totals for this report. Dimensions are counted independently.</p></section>';
+  $('modal').innerHTML = '<section class="modal report-modal" role="dialog" aria-modal="true" aria-labelledby="report-title"><div class="report-title"><h3 id="report-title">' +
+    esc(title) + '</h3><button class="report-close" id="closereport" aria-label="Close report">×</button></div>' +
+    (isTiers ? '' : '<div class="report-tools"><input id="reportsearch" class="searchbox" aria-label="Search report" placeholder="Search…"><select id="reportsort" aria-label="Sort report"><option value="visitors">Most views</option><option value="name">Name A–Z</option></select></div>') +
+    '<div id="expandedreport"></div><p class="note">' +
+    (isTiers ? 'Unrated includes page views from countries without a tier and page views without a recorded country.' :
+      'Daily totals for this report. Dimensions are counted independently.') + '</p></section>';
+  $('closereport').addEventListener('click', closeModal);
+  if (isTiers) {
+    renderPanel(group, { host: $('expandedreport'), key });
+    $('closereport').focus();
+    return;
+  }
   const refresh=()=>renderPanel(group,{host:$('expandedreport'),key,expanded:true,query:$('reportsearch').value,sort:$('reportsort').value});
-  $('closereport').addEventListener('click',closeModal);$('reportsearch').addEventListener('input',refresh);$('reportsort').addEventListener('change',refresh);refresh();$('reportsearch').focus();
+  $('reportsearch').addEventListener('input',refresh);$('reportsort').addEventListener('change',refresh);refresh();$('reportsearch').focus();
 }
 document.addEventListener('keydown', event => {
   if (event.key === 'Escape') { closeModal(); closeMenus(); }
@@ -1404,8 +1479,9 @@ function buildPaths() {
   }
 }
 
+const REGION_NAMES = new Intl.DisplayNames(undefined, { type: "region" });
 function countryName(iso) {
-  return (WORLD[iso] && WORLD[iso].n) || iso;
+  return WORLD[iso]?.n || (/^[A-Z]{2}$/.test(iso) ? REGION_NAMES.of(iso) : iso);
 }
 
 function visitorsByCountry() {

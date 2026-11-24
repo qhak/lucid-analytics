@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 
 const source = readFileSync(new URL('../src/worker.js', import.meta.url), 'utf8');
 const context = vm.createContext({ URL, Response, Headers, crypto: globalThis.crypto });
-vm.runInContext(source.replace('export default {', 'var worker = {'), context);
+vm.runInContext(source.replace(/^import .*$/m, '').replace('export default {', 'var worker = {'), context);
 const { validateEvent, originAllowed, handleEvent } = context;
 const origin = 'https://example.com';
 const valid = { d: 'example.com', u: origin + '/pricing', n: 'pageview', delta_ms: 0 };

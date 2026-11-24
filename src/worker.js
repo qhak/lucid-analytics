@@ -14,14 +14,19 @@
  *   GET    /api/excluded  private — list of places dropped at ingest
  *   POST   /api/excluded  private — add a place to drop
  *   DELETE /api/excluded  private — stop dropping a place
+ *   POST   /replay        public  — session replay chunks (see replays.js)
+ *   GET    /replay-recorder.js public — rrweb recorder loaded by tracker.js
+ *   GET    /api/replays   private — recorded visitor sessions for a site
+ *   GET    /api/replay    private — one session's recording
  *   GET    /*             private — dashboard UI (served from ./public)
  *
- * Everything except /event and /tracker.js sits behind HTTP Basic Auth.
+ * Everything except /event, /replay and the two scripts sits behind HTTP Basic Auth.
  *
  * Sites live in the D1 `sites` table so they can be added from the UI;
  * ALLOWED_SITES in wrangler.toml still works as a bootstrap list and the two
- * are unioned. New requests increment independent daily totals. They do not
- * create visitor IDs, session IDs, exact event timestamps or event properties.
+ * are unioned. /event requests increment independent daily totals and carry no
+ * visitor or session ID. Session replay is separate: it records each visit
+ * under a random per-tab session ID and keeps it for RETENTION_DAYS.
  *
  * Live-only, on purpose: there is no import feature. An importer that has to
  * guess which of two export formats it received, and whether the numbers were
@@ -29,9 +34,17 @@
  * that starts at zero and only ever shows what actually happened.
  */
 
+import { handleReplayIngest, handleReplayList, handleReplayGet, purgeExpiredReplays } from "./replays.js";
+
 /* ------------------------------------------------------------------ */
 /* routing                                                             */
 /* ------------------------------------------------------------------ */
+
+// Helpers replays.js needs from this file.
+const replayHelpers = () => ({
+  corsHeaders, normalizeDomain, DOMAIN_RE, allowedSites, looksLikeBot,
+  excludedPlaces, isExcludedPlace, parseUA, json,
+});
 
 export default {
   async fetch(request, env, ctx) {
@@ -42,6 +55,21 @@ export default {
     if (url.pathname === "/event") {
       if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
       return handleEvent(request, env, ctx);
+    }
+
+    if (url.pathname === "/replay") {
+      if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+      return handleReplayIngest(request, env, url, replayHelpers());
+    }
+
+    // Loaded by tracker.js on tracked sites, so public like the tracker.
+    if (url.pathname === "/replay-recorder.js") {
+      const res = await env.ASSETS.fetch(new Request(new URL("/vendor/rrweb-record.min.js", url), request));
+      const headers = new Headers(res.headers);
+      headers.set("Content-Type", "application/javascript; charset=utf-8");
+      headers.set("Access-Control-Allow-Origin", "*");
+      headers.set("Cache-Control", "public, max-age=86400");
+      return new Response(res.body, { status: res.status, headers });
     }
 
     // The tracker is loaded by browsers on the tracked sites, so it is the one
@@ -84,6 +112,8 @@ export default {
     if (["/api/journey", "/api/visits", "/api/events", "/api/automation"].includes(url.pathname)) {
       return json({ error: "Per-visitor reports are disabled. This dashboard uses aggregate daily totals." }, 410);
     }
+    if (url.pathname === "/api/replays" && request.method === "GET") return handleReplayList(env, url, replayHelpers());
+    if (url.pathname === "/api/replay" && request.method === "GET") return handleReplayGet(env, url, replayHelpers());
     if (url.pathname === "/api/excluded") {
       if (request.method === "GET") return handleExcludedList(env);
       if (request.method === "POST") return handleExcludedAdd(request, env);
@@ -102,6 +132,10 @@ export default {
     return new Response(asset.body, { status: asset.status, headers });
   },
 
+  // Daily cron (wrangler.toml [triggers]): drop recordings past retention.
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(purgeExpiredReplays(env));
+  },
 };
 
 /* ------------------------------------------------------------------ */
