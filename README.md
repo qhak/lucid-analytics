@@ -14,12 +14,17 @@ The dashboard includes:
 - Independent breakdowns for referrer domain, channel, page, country, browser, operating system and device
 - Daily and monthly charts, plus retained all-time totals
 - A password-protected dashboard and configurable location exclusions
+- Session replay: a list of recorded visitors; click one to watch the visit and jump to how the page looked after each click
 
 The feature set grew from questions I wanted to answer about my own sites. The project is still single-tenant: one dashboard password protects the instance, and there is no signup, billing, or multi-customer account system.
 
 ## Privacy choices and trade-offs
 
-New analytics are stored as independent daily counters. The database does not receive visitor or session IDs, event-level timestamps, event properties, full referrer URLs, IP addresses or full user-agent strings. The worker uses the request IP and user-agent only transiently to apply configured location exclusions and classify broad country/browser/device categories. Dimensions are counted independently; the database does not keep a row linking an action to a particular page, location or device.
+**Session replay records individual visits.** Unlike the daily counters below, the tracker also records each visit with rrweb (page structure, clicks, scrolls, mouse movement) under a random per-tab session ID, plus the visit's country and browser/OS/device. Form input values are always masked. Recordings are kept for 30 days and then deleted by a daily cron. Any site using this tracker should say so in its privacy notice; review whether consent is required where the site operates. The tracker stops recording when the site's `listvintAnalyticsConsent()` hook returns false or `listvintStopLucid()` is called.
+
+To keep part of a page out of recordings, add `data-lucid-mask` (text replaced with asterisks) or `data-lucid-block` (element not recorded at all) to it.
+
+The daily totals are separate. New analytics are stored as independent daily counters. The `daily_analytics` table does not receive visitor or session IDs, event-level timestamps, event properties, full referrer URLs, IP addresses or full user-agent strings. The worker uses the request IP and user-agent only transiently to apply configured location exclusions and classify broad country/browser/device categories. Dimensions are counted independently; the database does not keep a row linking an action to a particular page, location or device.
 
 The `events` and `session_quality` tables retain historical visit-level records from before aggregate-only ingestion was introduced. The migration does not delete them. Per-visit, journey, event-feed and automation-detail endpoints are disabled; historical rows remain in D1 until the operator deletes them manually. Daily aggregates also have no automatic expiry.
 
@@ -28,7 +33,7 @@ Listvint turns aggregate analytics on by default and provides a browser-level of
 ## A few implementation decisions
 
 - **Self-hosted collection:** the tracking endpoint, dashboard and database run in the owner's Cloudflare account.
-- **Small tracker:** it sends only a safe page path, a fixed event name and (on page views) the referrer origin. Custom properties and query strings are ignored.
+- **Small tracker:** for the daily counters it sends only a safe page path, a fixed event name and (on page views) the referrer origin. The session recorder (~76KB) is loaded separately so the base script stays small. Custom properties and query strings are ignored.
 - **Daily aggregation:** counters are stored by UTC date and a single independent dimension, without a person-level event sequence.
 - **Listvint deployment retention:** new aggregate counts and older historical event/visit rows have no automatic expiry. The operator must clear them manually.
 - **No billing system:** this began as a tool for my own use, so account plans, subscriptions and customer management are outside its scope.
@@ -51,6 +56,7 @@ Run the checks from the repository root:
 node scripts/test-event-validation.mjs
 node scripts/test-automation.mjs
 node scripts/test-automation-api.mjs
+node scripts/test-replays.mjs
 ```
 
 The automation tests create temporary in-memory SQLite databases; they do not
@@ -78,13 +84,19 @@ Lucid is built around Cloudflare Workers and D1. To create a separate instance:
    npx wrangler d1 execute lucid-analytics --remote --file=./schema.sql
    ```
 
-4. Set the dashboard password as a Worker secret:
+4. Create the R2 bucket that stores session recordings (bound as `REPLAYS` in `wrangler.toml`):
+
+   ```bash
+   npx wrangler r2 bucket create lucid-replays
+   ```
+
+5. Set the dashboard password as a Worker secret:
 
    ```bash
    npx wrangler secret put DASH_PASSWORD
    ```
 
-5. Apply the aggregate-only migration, set `ALLOWED_SITES` in `wrangler.toml` to the site origins allowed to send events, then deploy:
+6. Apply the migrations (including `010-session-replay.sql`), set `ALLOWED_SITES` in `wrangler.toml` to the site origins allowed to send events, then deploy:
 
    ```bash
    npx wrangler d1 migrations apply listvint-analytics --remote
@@ -116,7 +128,10 @@ For this Listvint deployment, accepted action names are explicitly allowlisted i
 | Path | Purpose |
 | --- | --- |
 | `src/worker.js` | Aggregate event collection, authentication and dashboard APIs |
-| `public/tracker.js` | Site tracking script |
+| `src/replays.js` | Session replay upload, listing, playback and 30-day cleanup |
+| `public/tracker.js` | Site tracking script (counters + session recording) |
+| `public/visitors.js` | Dashboard Visitors panel and replay viewer |
+| `public/vendor/` | rrweb recorder and player (MIT, see `NOTICE.md`) |
 | `public/` | Dashboard assets |
 | `schema.sql` | Schema for a fresh database |
 | `migrations/` | Incremental schema changes |

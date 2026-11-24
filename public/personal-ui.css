@@ -100,3 +100,33 @@
 .preview-field input.domain {margin:0}
 .toolbar-right {flex-wrap:wrap}
 @media(max-width:480px) {.preview-banner {align-items:flex-start;flex-direction:column}.preview-fields {gap:12px}.preview-modal {padding:20px}.sites-toolbar {flex-wrap:wrap}.sites-toolbar .searchbox {width:100%}.sites-toolbar .toolbar-right {width:100%;justify-content:flex-end}.preview-modal .actions {margin-top:18px}}
+
+:root {
+  --tier-0-fill:#626876;--tier-1-fill:#c6a054;--tier-2-fill:#a7b8d0;--tier-3-fill:#b77b62;
+  --tier-1-ink:#6e531c;--tier-2-ink:#465871;--tier-3-ink:#79452f;
+}
+:root[data-theme="dark"] {
+  --tier-1-ink:#ead095;--tier-2-ink:#ced9ed;--tier-3-ink:#edb69d;
+}
+[data-tier="0"] {--tier-fill:var(--tier-0-fill)}
+[data-tier="1"] {--tier-fill:var(--tier-1-fill);--tier-ink:var(--tier-1-ink)}
+[data-tier="2"] {--tier-fill:var(--tier-2-fill);--tier-ink:var(--tier-2-ink)}
+[data-tier="3"] {--tier-fill:var(--tier-3-fill);--tier-ink:var(--tier-3-ink)}
+.row .country-label {display:flex;align-items:center;gap:7px}
+.country-name {overflow:hidden;text-overflow:ellipsis}
+.country-flag {flex:none;font-family:"Apple Color Emoji","Segoe UI Emoji","Noto Color Emoji",sans-serif}
+.country-tier {
+  flex:none;padding:0 4px;border-radius:3px;
+  color:var(--tier-ink);background:color-mix(in srgb,var(--tier-fill) 18%,var(--card));
+  font-size:10px;font-weight:600;line-height:1.6;
+}
+.tier-caption {margin:0 0 16px;color:var(--mute);font-size:12px}
+.tier-report {display:flex;align-items:center;justify-content:center;gap:clamp(12px,3vw,28px);flex-wrap:wrap;padding:4px 0 12px}
+.tier-pie {width:clamp(104px,33%,176px);aspect-ratio:1;border-radius:50%;flex:none}
+.tier-legend {list-style:none;margin:0;padding:0;flex:1 1 122px;max-width:240px;font-size:12px}
+.tier-legend li {display:grid;grid-template-columns:1fr auto auto;align-items:center;gap:8px;padding:6px 0}
+.tier-legend li + li {border-top:1px solid var(--line)}
+.tier-key {display:flex;align-items:center;gap:7px}
+.tier-swatch {width:8px;height:8px;border-radius:2px;background:var(--tier-fill)}
+.tier-count {color:var(--mute)}
+.tier-legend strong {min-width:3.4em;text-align:right;font-weight:600}

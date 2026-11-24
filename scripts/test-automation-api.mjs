@@ -19,7 +19,7 @@ let automationReads=0;
 const adapter={prepare(sql){if(sql.startsWith('SELECT DISTINCT session_id FROM session_automation_exclusions'))automationReads++;return{bind(...binds){return statement(sql,binds);},...statement(sql,[]) };},async batch(statements){return Promise.all(statements.map(s=>s.all()));}};
 function statement(sql,binds){return{async all(){return{results:db.prepare(sql).all(...binds)};},async first(){return db.prepare(sql).get(...binds)||null;},async run(){return db.prepare(sql).run(...binds);}};}
 const context=vm.createContext({URL,Response,Headers,atob,TextEncoder,crypto:globalThis.crypto});
-vm.runInContext(readFileSync(new URL('../src/worker.js',import.meta.url),'utf8').replace('export default {','var worker = {'),context);
+vm.runInContext(readFileSync(new URL('../src/worker.js',import.meta.url),'utf8').replace(/^import .*$/m,'').replace('export default {','var worker = {'),context);
 const env={DB:adapter,DASH_PASSWORD:'local-test-only',ID_SALT:'local-test-only',ALLOWED_SITES:'example.test'};
 const auth='Basic '+Buffer.from('admin:'+env.DASH_PASSWORD).toString('base64');
 let checks=0;

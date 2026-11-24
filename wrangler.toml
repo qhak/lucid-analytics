@@ -24,6 +24,12 @@ binding = "DB"
 database_name = "listvint-analytics"
 database_id = "7f768771-4ff3-4a87-b557-826e87a49452"
 
+# Session replay recordings (rrweb chunks). Create the bucket once:
+#   npx wrangler r2 bucket create lucid-replays
+[[r2_buckets]]
+binding = "REPLAYS"
+bucket_name = "lucid-replays"
+
 [vars]
 # Sites allowed to send events. Anything not listed is rejected, so a
 # stranger who finds the endpoint can't pollute your numbers.
@@ -38,7 +44,8 @@ ALLOWED_SITES = "listvint-studio.koa2.chatgpt.site"
 ALLOW_LOCAL_DEV = "0"
 
 [triggers]
-crons = []
+# Daily: delete session recordings older than 30 days (src/replays.js).
+crons = ["17 3 * * *"]
 
 # SECRETS — never commit these. Set them with:
 #
